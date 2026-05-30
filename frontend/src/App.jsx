@@ -28,7 +28,7 @@ function App() {
   const displayStreamRef = useRef(null);
 
   // --------------------------------
-  // PUSH TEXT TO SERVER
+  // PUSH TEXT
   // --------------------------------
   const pushText = async (txt, sid) => {
     if (!txt || !sid) return;
@@ -40,17 +40,17 @@ function App() {
   };
 
   // --------------------------------
-  // START RECOGNITION
-  // Uses mic only, or mixed mic+system
+  // CREATE FRESH RECOGNITION INSTANCE
+  // Called every time recognition ends
+  // so browser gets a brand new object
   // --------------------------------
-  const startRecognition = (sid, stream) => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Web Speech API not supported. Use Chrome on desktop.");
-      return;
-    }
+  const createAndStartRecognition = (sid) => {
+    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
+    if (!SpeechRecognition) return;
 
+    // Always create NEW instance — never reuse old one
     const rec = new SpeechRecognition();
-    rec.continuous = true;
+    rec.continuous = false; // false = more stable across browsers
     rec.interimResults = false;
     rec.lang = "hi-IN";
 
@@ -65,27 +65,27 @@ function App() {
     };
 
     rec.onerror = (e) => {
-      // Only log, don't restart on abort — prevents spam
-      if (e.error !== "aborted" && e.error !== "no-speech") {
-        console.error("Recognition error:", e.error);
-        setErrorMsg(`Recognition error: ${e.error}`);
+      if (e.error === "not-allowed") {
+        setErrorMsg("Mic permission denied. Allow mic in browser settings.");
+        stopSession();
+        return;
       }
+      // All other errors (aborted, no-speech, network) — just restart
     };
 
     rec.onend = () => {
-      // Restart only if still running
+      // Restart with fresh instance after short delay
       if (isRunningRef.current && sessionIdRef.current === sid) {
-        setTimeout(() => {
-          try { rec.start(); } catch(e) {}
-        }, 300);
+        setTimeout(() => createAndStartRecognition(sid), 200);
       }
     };
 
     try {
       rec.start();
       recognitionRef.current = rec;
-    } catch(e) {
-      console.error("Could not start recognition:", e);
+    } catch (e) {
+      // If start fails wait and retry
+      setTimeout(() => createAndStartRecognition(sid), 500);
     }
   };
 
@@ -94,7 +94,7 @@ function App() {
   // --------------------------------
   const startSession = async () => {
     if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome on desktop for Web Speech API.");
+      setErrorMsg("Use Chrome on desktop. Web Speech API not supported here.");
       return;
     }
 
@@ -104,56 +104,46 @@ function App() {
       const res = await axios.post(`${API}/start-session`);
       const newSessionId = res.data.session_id;
 
-      setSessionId(newSessionId);
       sessionIdRef.current = newSessionId;
+      isRunningRef.current = true;
+
+      setSessionId(newSessionId);
       setSelectedSession(newSessionId);
       setText("");
       setIsRunning(true);
-      isRunningRef.current = true;
-
-      // Step 1: Always start mic recognition
       setAudioSources(["mic"]);
-      startRecognition(newSessionId, null);
 
-      // Step 2: Try to get system audio via screen share
-      // This is optional — if user cancels, mic still works
+      // Start fresh recognition
+      createAndStartRecognition(newSessionId);
+
+      // Try system audio (optional)
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: false,  // audio-only request
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-          }
+          video: false,
+          audio: { echoCancellation: false, noiseSuppression: false }
         });
 
         displayStreamRef.current = displayStream;
 
-        const hasAudio = displayStream.getAudioTracks().length > 0;
-
-        if (hasAudio) {
+        if (displayStream.getAudioTracks().length > 0) {
           setAudioSources(["mic", "system"]);
-
-          // When user stops sharing
           displayStream.getAudioTracks()[0].onended = () => {
             setAudioSources(prev => prev.filter(s => s !== "system"));
             displayStreamRef.current = null;
           };
         } else {
-          // No audio track — user didn't tick "Share audio"
           displayStream.getTracks().forEach(t => t.stop());
-          setErrorMsg("No system audio captured. Tip: tick 'Share audio' when sharing. Mic still recording.");
+          setErrorMsg("Tip: tick 'Share audio' when sharing screen for system audio. Mic still active.");
         }
-
-      } catch (err) {
-        // User cancelled screen share — fine, mic still works
-        console.log("Screen share cancelled or not available:", err.message);
+      } catch {
+        // User cancelled screen share — mic still works fine
       }
 
     } catch (err) {
       console.error(err);
-      setErrorMsg("Failed to start session. Check server.");
-      setIsRunning(false);
+      setErrorMsg("Failed to start session. Check server connection.");
       isRunningRef.current = false;
+      setIsRunning(false);
     }
   };
 
@@ -165,7 +155,7 @@ function App() {
     sessionIdRef.current = "";
 
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch(e) {}
+      try { recognitionRef.current.abort(); } catch (e) {}
       recognitionRef.current = null;
     }
 
@@ -176,7 +166,6 @@ function App() {
 
     setIsRunning(false);
     setAudioSources([]);
-    setErrorMsg("");
   };
 
   // --------------------------------
@@ -266,23 +255,18 @@ function App() {
 
       <div className="controls">
         <div className="left-controls">
-
           <button onClick={startSession} className="main-btn start-btn" disabled={isRunning}>
             <Play size={18} /> Start
           </button>
-
           <button onClick={stopSession} className="main-btn stop-btn" disabled={!isRunning}>
             <Square size={18} /> Stop
           </button>
-
           <button onClick={downloadPDF} className="main-btn">
             <Download size={18} /> PDF
           </button>
-
           <button onClick={downloadWord} className="main-btn">
             <Download size={18} /> Word
           </button>
-
         </div>
 
         <div className="right-controls">
@@ -301,12 +285,10 @@ function App() {
         </div>
       </div>
 
-      {/* ERROR MESSAGE */}
       {errorMsg && (
         <div className="error-msg">⚠️ {errorMsg}</div>
       )}
 
-      {/* STATUS */}
       <div className="status">
         <div className={isRunning ? "status-dot active" : "status-dot"} />
         <span>{isRunning ? "Translation Running" : "Translation Stopped"}</span>
