@@ -343,7 +343,7 @@ recognizer = sr.Recognizer()
 # --------------------------------
 # CONFIG — change to your Render URL
 # --------------------------------
-CLOUD_URL = "https://your-app.onrender.com"
+CLOUD_URL = "https://speechtotext-060i.onrender.com"
 
 # --------------------------------
 # SESSION ID — unique per run
