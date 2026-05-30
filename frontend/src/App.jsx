@@ -1,626 +1,185 @@
-// import { useEffect, useRef, useState } from "react";
-// import axios from "axios";
-// import jsPDF from "jspdf";
-// import { saveAs } from "file-saver";
-
-// import {
-//   Document,
-//   Packer,
-//   Paragraph
-// } from "docx";
-
-// import {
-//   Moon,
-//   Sun,
-//   Play,
-//   Square,
-//   Download
-// } from "lucide-react";
-
-// import "./index.css";
-
-// function App() {
-
-//   // --------------------------------
-//   // STATES
-//   // --------------------------------
-//   const [text, setText] = useState("");
-
-//   const [darkMode, setDarkMode] =
-//     useState(true);
-
-//   const [isRunning, setIsRunning] =
-//     useState(false);
-
-//   const [transcripts, setTranscripts] =
-//     useState([]);
-
-//   const [selectedFile, setSelectedFile] =
-//     useState("");
-
-//   const textareaRef = useRef(null);
-
-//   const [audioFiles, setAudioFiles] =
-//     useState([]);
-
-//   const [selectedAudio, setSelectedAudio] =
-//     useState("");
-
-//   const [isAudioRecording, setIsAudioRecording] =
-//     useState(false);
-
-//   // --------------------------------
-//   // START SESSION
-//   // --------------------------------
-//   const startSession = async () => {
-
-//     try {
-
-//       const res = await axios.get(
-//         "http://localhost:5000/start-session"
-//       );
-
-//       const newFile =
-//         res.data.filename;
-
-//       setSelectedFile(newFile);
-
-//       setText("");
-
-//       setIsRunning(true);
-//       setIsAudioRecording(true);
-
-//     } catch (err) {
-
-//       console.log(err);
-//     }
-//   };
-
-//   // --------------------------------
-//   // STOP SESSION
-//   // --------------------------------
-//   const stopSession = () => {
-
-//     setIsRunning(false);
-//     setIsAudioRecording(false);
-//   };
-
-//   // --------------------------------
-//   // LOAD TRANSCRIPT LIST
-//   // --------------------------------
-//   useEffect(() => {
-
-//     const interval = setInterval(
-//       async () => {
-
-//         try {
-
-//           const filesRes =
-//             await axios.get(
-//               "http://localhost:5000/transcripts"
-//             );
-
-//           setTranscripts(
-//             filesRes.data
-//           );
-
-//           const audioRes =
-//             await axios.get(
-//               "http://localhost:5000/audio-files"
-//             );
-
-//           setAudioFiles(
-//             audioRes.data
-//           );
-
-//         } catch (err) {
-
-//           console.log(err);
-//         }
-
-//       },
-//       2000
-//     );
-
-//     return () =>
-//       clearInterval(interval);
-
-//   }, []);
-
-//   // --------------------------------
-//   // LIVE FETCH CURRENT FILE
-//   // --------------------------------
-//   useEffect(() => {
-
-//     let interval;
-
-//     if (
-//       isRunning &&
-//       selectedFile
-//     ) {
-
-//       interval = setInterval(
-//         async () => {
-
-//           try {
-
-//             const res =
-//               await axios.get(
-//                 `http://localhost:5000/transcript/${selectedFile}`
-//               );
-
-//             setText(
-//               res.data.text
-//             );
-
-//           } catch (err) {
-
-//             console.log(err);
-//           }
-
-//         },
-//         2000
-//       );
-//     }
-
-//     return () =>
-//       clearInterval(interval);
-
-//   }, [
-//     isRunning,
-//     selectedFile
-//   ]);
-
-//   // --------------------------------
-//   // AUTO SCROLL
-//   // --------------------------------
-//   useEffect(() => {
-
-//     if (
-//       textareaRef.current
-//     ) {
-
-//       textareaRef.current.scrollTop =
-//         textareaRef.current.scrollHeight;
-//     }
-
-//   }, [text]);
-
-//   // --------------------------------
-//   // LOAD OLD FILE
-//   // --------------------------------
-//   const loadTranscript =
-//     async (filename) => {
-
-//       try {
-
-//         setSelectedFile(
-//           filename
-//         );
-
-//         const res =
-//           await axios.get(
-//             `http://localhost:5000/transcript/${filename}`
-//           );
-
-//         setText(
-//           res.data.text
-//         );
-
-//       } catch (err) {
-
-//         console.log(err);
-//       }
-//     };
-
-//   // --------------------------------
-//   // PDF DOWNLOAD
-//   // --------------------------------
-//   const downloadPDF = () => {
-
-//     const doc = new jsPDF();
-
-//     doc.text(
-//       text,
-//       10,
-//       10
-//     );
-
-//     doc.save(
-//       "translation.pdf"
-//     );
-//   };
-
-//   // --------------------------------
-//   // WORD DOWNLOAD
-//   // --------------------------------
-//   const downloadWord = async () => {
-
-//     const doc =
-//       new Document({
-
-//         sections: [
-//           {
-//             properties: {},
-
-//             children: [
-//               new Paragraph(
-//                 text
-//               )
-//             ]
-//           }
-//         ]
-//       });
-
-//     const blob =
-//       await Packer.toBlob(
-//         doc
-//       );
-
-//     saveAs(
-//       blob,
-//       "translation.docx"
-//     );
-//   };
-
-//   // --------------------------------
-//   // UI
-//   // --------------------------------
-//   return (
-
-//     <div
-//       className={
-//         darkMode
-//           ? "app dark"
-//           : "app"
-//       }
-//     >
-
-//       {/* HEADER */}
-//       <div className="header">
-
-//         <div>
-
-//           <h1>
-//             AI Live Translator
-//           </h1>
-
-//           <p className="subtitle">
-//             Real-time multilingual subtitle system
-//           </p>
-
-//         </div>
-
-//         <button
-//           onClick={() =>
-//             setDarkMode(
-//               !darkMode
-//             )
-//           }
-//           className="theme-btn"
-//         >
-
-//           {
-//             darkMode
-//               ? <Sun size={20} />
-//               : <Moon size={20} />
-//           }
-
-//         </button>
-
-//       </div>
-
-//       {/* CONTROLS */}
-//       <div className="controls">
-
-//         <div className="left-controls">
-
-//           <button
-//             onClick={
-//               startSession
-//             }
-//             className="
-//               main-btn
-//               start-btn
-//             "
-//           >
-
-//             <Play size={18} />
-
-//             Start
-
-//           </button>
-
-//           <button
-//             onClick={
-//               stopSession
-//             }
-//             className="
-//               main-btn
-//               stop-btn
-//             "
-//           >
-
-//             <Square size={18} />
-
-//             Stop
-
-//           </button>
-
-//           <button
-//             onClick={
-//               downloadPDF
-//             }
-//             className="
-//               main-btn
-//             "
-//           >
-
-//             <Download size={18} />
-
-//             PDF
-
-//           </button>
-
-//           <button
-//             onClick={
-//               downloadWord
-//             }
-//             className="
-//               main-btn
-//             "
-//           >
-
-//             <Download size={18} />
-
-//             Word
-
-//           </button>
-
-//         </div>
-
-//         {/* DROPDOWN ONLY WHEN STOPPED */}
-//         <div className="right-controls">
-
-//           {!isRunning && (
-
-//             <>
-//               {/* Previous Transcripts */}
-//               <select
-//                 value={selectedFile}
-//                 onChange={(e) =>
-//                   loadTranscript(
-//                     e.target.value
-//                   )
-//                 }
-//                 className="dropdown"
-//               >
-
-//                 <option value="">
-//                   Previous Transcripts
-//                 </option>
-
-//                 {transcripts.map(
-//                   (file) => (
-
-//                     <option
-//                       key={file}
-//                       value={file}
-//                     >
-
-//                       {file}
-
-//                     </option>
-
-//                   )
-//                 )}
-
-//               </select>
-
-//               {/* Previous Audio */}
-//               <select
-//                 value={selectedAudio}
-//                 onChange={(e) =>
-//                   setSelectedAudio(
-//                     e.target.value
-//                   )
-//                 }
-//                 className="dropdown"
-//               >
-
-//                 <option value="">
-//                   Previous Audio
-//                 </option>
-
-//                 {audioFiles.map(
-//                   (file) => (
-
-//                     <option
-//                       key={file}
-//                       value={file}
-//                     >
-
-//                       {file}
-
-//                     </option>
-
-//                   )
-//                 )}
-
-//               </select>
-
-//               {/* ADDED: Audio preview player — appears when an audio file is selected */}
-//               {selectedAudio && (
-//                 <audio
-//                   key={selectedAudio}
-//                   controls
-//                   className="audio-preview"
-//                   src={`http://localhost:5000/audio/${selectedAudio}`}
-//                 />
-//               )}
-
-//             </>
-
-//           )}
-
-//         </div>
-
-//       </div>
-
-//       {/* STATUS */}
-//       <div className="status">
-
-//         <div
-//           className={
-//             isRunning
-//               ? "status-dot active"
-//               : "status-dot"
-//           }
-//         />
-
-//         <span>
-
-//           {
-//             isRunning
-//               ? "Translation Running"
-//               : "Translation Stopped"
-//           }
-
-//         </span>
-
-//         <div
-//           className={
-//             isAudioRecording
-//               ? "audio-dot active"
-//               : "audio-dot"
-//           }
-//         />
-
-//         <span>
-
-//           {
-//             isAudioRecording
-//               ? "Audio Recording"
-//               : "Audio Stopped"
-//           }
-
-//         </span>
-
-//       </div>
-
-//       {/* TRANSCRIPT */}
-//       <div
-//         className="
-//           transcript-container
-//         "
-//       >
-
-//         <textarea
-
-//           ref={textareaRef}
-
-//           value={text}
-
-//           readOnly
-
-//           rows={22}
-
-//           placeholder="
-//             Live subtitles...
-//           "
-
-//           className="
-//             transcript-box
-//           "
-//         />
-
-//       </div>
-
-//     </div>
-//   );
-// }
-
-// export default App;
-
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import jsPDF from "jspdf";
 import { saveAs } from "file-saver";
-
-import {
-  Document,
-  Packer,
-  Paragraph
-} from "docx";
-
-import {
-  Moon,
-  Sun,
-  Play,
-  Square,
-  Download
-} from "lucide-react";
-
+import { Document, Packer, Paragraph } from "docx";
+import { Moon, Sun, Play, Square, Download, Mic, Monitor } from "lucide-react";
 import "./index.css";
 
-// --------------------------------
-// CHANGE THIS to your Render URL
-// --------------------------------
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
+// --------------------------------
+// Web Speech Recognition setup
+// --------------------------------
+const SpeechRecognition =
+  window.SpeechRecognition || window.webkitSpeechRecognition;
+
 function App() {
-
-  // --------------------------------
-  // STATES
-  // --------------------------------
   const [text, setText] = useState("");
-
-  const [darkMode, setDarkMode] =
-    useState(true);
-
-  const [isRunning, setIsRunning] =
-    useState(false);
-
-  const [transcripts, setTranscripts] =
-    useState([]);
-
-  const [selectedFile, setSelectedFile] =
-    useState("");
+  const [darkMode, setDarkMode] = useState(true);
+  const [isRunning, setIsRunning] = useState(false);
+  const [sessions, setSessions] = useState([]);
+  const [selectedSession, setSelectedSession] = useState("");
+  const [sessionId, setSessionId] = useState("");
+  const [status, setStatus] = useState("idle"); // idle | running | error
+  const [audioSources, setAudioSources] = useState([]); // ["mic","system"]
 
   const textareaRef = useRef(null);
-
-  const [selectedAudio, setSelectedAudio] =
-    useState("");
-
-  const [isAudioRecording, setIsAudioRecording] =
-    useState(false);
-
-  const [audioAvailable, setAudioAvailable] =
-    useState(false);
+  const recognitionMicRef = useRef(null);
+  const recognitionSysRef = useRef(null);
+  const sessionIdRef = useRef("");
 
   // --------------------------------
   // START SESSION
   // --------------------------------
   const startSession = async () => {
+    if (!SpeechRecognition) {
+      alert("Your browser does not support Web Speech API. Use Chrome.");
+      return;
+    }
 
     try {
-
-      const res = await axios.get(
-        `${API}/start-session`
-      );
-
-      const newFile = res.data.session_id || res.data.filename;
-
-      setSelectedFile(newFile);
-      setSelectedAudio(newFile);
+      const res = await axios.post(`${API}/start-session`);
+      const newSessionId = res.data.session_id;
+      setSessionId(newSessionId);
+      sessionIdRef.current = newSessionId;
+      setSelectedSession(newSessionId);
       setText("");
-      setAudioAvailable(false);
       setIsRunning(true);
-      setIsAudioRecording(true);
+      setStatus("running");
+
+      // Start both audio sources
+      startMicRecognition(newSessionId);
+      startSystemRecognition(newSessionId);
 
     } catch (err) {
+      console.error(err);
+      setStatus("error");
+    }
+  };
 
-      console.log(err);
+  // --------------------------------
+  // PUSH TEXT TO SERVER
+  // --------------------------------
+  const pushText = async (text, sid) => {
+    if (!text || !sid) return;
+    try {
+      await axios.post(`${API}/push`, {
+        session_id: sid,
+        text
+      });
+    } catch (err) {
+      console.error("Push error:", err);
+    }
+  };
+
+  // --------------------------------
+  // MIC RECOGNITION
+  // --------------------------------
+  const startMicRecognition = (sid) => {
+    if (!SpeechRecognition) return;
+
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.lang = "hi-IN"; // auto-detects Hindi/Bengali/English
+
+    rec.onresult = (e) => {
+      const transcript = Array.from(e.results)
+        .filter(r => r.isFinal)
+        .map(r => r[0].transcript)
+        .join(" ");
+
+      if (transcript) {
+        pushText(`[Mic] ${transcript}`, sid);
+      }
+    };
+
+    rec.onerror = (e) => console.error("Mic recognition error:", e.error);
+
+    rec.onend = () => {
+      // Auto restart if still running
+      if (sessionIdRef.current === sid) {
+        rec.start();
+      }
+    };
+
+    rec.start();
+    recognitionMicRef.current = rec;
+    setAudioSources(prev => [...new Set([...prev, "mic"])]);
+  };
+
+  // --------------------------------
+  // SYSTEM / TAB AUDIO RECOGNITION
+  // --------------------------------
+  const startSystemRecognition = async (sid) => {
+    try {
+      // Ask user to share screen/tab — this gives system audio
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true, // required by browser even if we don't use video
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          sampleRate: 44100
+        }
+      });
+
+      // Check if audio track exists
+      const audioTracks = displayStream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        console.warn("No system audio track. User may not have checked 'Share audio'.");
+        // Stop video track we don't need
+        displayStream.getVideoTracks().forEach(t => t.stop());
+        return;
+      }
+
+      // Stop video — only need audio
+      displayStream.getVideoTracks().forEach(t => t.stop());
+
+      // Pipe system audio into Web Speech via AudioContext
+      const audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(displayStream);
+      const dest = audioCtx.createMediaStreamDestination();
+      source.connect(dest);
+
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.lang = "hi-IN";
+
+      // Attach the processed stream
+      rec.onresult = (e) => {
+        const transcript = Array.from(e.results)
+          .filter(r => r.isFinal)
+          .map(r => r[0].transcript)
+          .join(" ");
+
+        if (transcript) {
+          pushText(`[System] ${transcript}`, sid);
+        }
+      };
+
+      rec.onerror = (e) => console.error("System recognition error:", e.error);
+
+      rec.onend = () => {
+        if (sessionIdRef.current === sid) {
+          rec.start();
+        }
+      };
+
+      rec.start();
+      recognitionSysRef.current = rec;
+      setAudioSources(prev => [...new Set([...prev, "system"])]);
+
+      // If user stops screen share, stop recognition
+      displayStream.getAudioTracks()[0].onended = () => {
+        rec.stop();
+        setAudioSources(prev => prev.filter(s => s !== "system"));
+      };
+
+    } catch (err) {
+      console.warn("System audio not available:", err.message);
+      // Not fatal — mic still works
     }
   };
 
@@ -628,174 +187,97 @@ function App() {
   // STOP SESSION
   // --------------------------------
   const stopSession = () => {
+    sessionIdRef.current = "";
+
+    if (recognitionMicRef.current) {
+      recognitionMicRef.current.stop();
+      recognitionMicRef.current = null;
+    }
+
+    if (recognitionSysRef.current) {
+      recognitionSysRef.current.stop();
+      recognitionSysRef.current = null;
+    }
 
     setIsRunning(false);
-    setIsAudioRecording(false);
-
-    // Check if audio was recorded for this session
-    if (selectedFile) {
-      checkAudioAvailable(selectedFile);
-    }
+    setStatus("idle");
+    setAudioSources([]);
   };
 
   // --------------------------------
-  // CHECK AUDIO AVAILABLE
-  // --------------------------------
-  const checkAudioAvailable = async (sessionId) => {
-
-    try {
-
-      const res = await axios.get(
-        `${API}/audio-exists/${sessionId}`
-      );
-
-      setAudioAvailable(res.data.hasAudio);
-
-    } catch {
-
-      setAudioAvailable(false);
-    }
-  };
-
-  // --------------------------------
-  // DOWNLOAD AUDIO
-  // --------------------------------
-  const downloadAudio = () => {
-
-    if (!selectedAudio) return;
-
-    // Direct browser download via link
-    const link = document.createElement("a");
-    link.href = `${API}/audio/${selectedAudio}`;
-    link.download = `session_${selectedAudio}.wav`;
-    link.click();
-  };
-
-  // --------------------------------
-  // LOAD TRANSCRIPT LIST
+  // LOAD SESSION LIST
   // --------------------------------
   useEffect(() => {
-
-    const interval = setInterval(
-      async () => {
-
-        try {
-
-          const filesRes = await axios.get(
-            `${API}/transcripts`
-          );
-
-          // API now returns [{id, label}] objects
-          setTranscripts(filesRes.data);
-
-        } catch (err) {
-
-          console.log(err);
-        }
-
-      },
-      2000
-    );
+    const interval = setInterval(async () => {
+      try {
+        const res = await axios.get(`${API}/transcripts`);
+        setSessions(res.data);
+      } catch (err) {
+        console.error(err);
+      }
+    }, 3000);
 
     return () => clearInterval(interval);
-
   }, []);
 
   // --------------------------------
-  // LIVE FETCH CURRENT FILE
+  // LIVE FETCH CURRENT SESSION TEXT
   // --------------------------------
   useEffect(() => {
-
     let interval;
 
-    if (isRunning && selectedFile) {
-
-      interval = setInterval(
-        async () => {
-
-          try {
-
-            const res = await axios.get(
-              `${API}/transcript/${selectedFile}`
-            );
-
-            setText(res.data.text);
-
-          } catch (err) {
-
-            console.log(err);
-          }
-
-        },
-        2000
-      );
+    if (isRunning && sessionId) {
+      interval = setInterval(async () => {
+        try {
+          const res = await axios.get(`${API}/transcript/${sessionId}`);
+          setText(res.data.text);
+        } catch (err) {
+          console.error(err);
+        }
+      }, 2000);
     }
 
     return () => clearInterval(interval);
-
-  }, [isRunning, selectedFile]);
+  }, [isRunning, sessionId]);
 
   // --------------------------------
   // AUTO SCROLL
   // --------------------------------
   useEffect(() => {
-
     if (textareaRef.current) {
-      textareaRef.current.scrollTop =
-        textareaRef.current.scrollHeight;
+      textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
     }
-
   }, [text]);
 
   // --------------------------------
   // LOAD OLD SESSION
   // --------------------------------
-  const loadTranscript = async (sessionId) => {
-
+  const loadSession = async (sid) => {
     try {
-
-      setSelectedFile(sessionId);
-      setSelectedAudio(sessionId);
-
-      const res = await axios.get(
-        `${API}/transcript/${sessionId}`
-      );
-
+      setSelectedSession(sid);
+      const res = await axios.get(`${API}/transcript/${sid}`);
       setText(res.data.text);
-
-      // Check if audio exists for this session
-      checkAudioAvailable(sessionId);
-
     } catch (err) {
-
-      console.log(err);
+      console.error(err);
     }
   };
 
   // --------------------------------
-  // PDF DOWNLOAD
+  // PDF
   // --------------------------------
   const downloadPDF = () => {
-
     const doc = new jsPDF();
     doc.text(text, 10, 10);
     doc.save("translation.pdf");
   };
 
   // --------------------------------
-  // WORD DOWNLOAD
+  // WORD
   // --------------------------------
   const downloadWord = async () => {
-
     const doc = new Document({
-      sections: [
-        {
-          properties: {},
-          children: [new Paragraph(text)]
-        }
-      ]
+      sections: [{ properties: {}, children: [new Paragraph(text)] }]
     });
-
     const blob = await Packer.toBlob(doc);
     saveAs(blob, "translation.docx");
   };
@@ -804,133 +286,85 @@ function App() {
   // UI
   // --------------------------------
   return (
-
     <div className={darkMode ? "app dark" : "app"}>
 
       {/* HEADER */}
       <div className="header">
-
         <div>
           <h1>AI Live Translator</h1>
           <p className="subtitle">Real-time multilingual subtitle system</p>
         </div>
-
-        <button
-          onClick={() => setDarkMode(!darkMode)}
-          className="theme-btn"
-        >
+        <button onClick={() => setDarkMode(!darkMode)} className="theme-btn">
           {darkMode ? <Sun size={20} /> : <Moon size={20} />}
         </button>
-
       </div>
 
       {/* CONTROLS */}
       <div className="controls">
-
         <div className="left-controls">
 
-          <button
-            onClick={startSession}
-            className="main-btn start-btn"
-          >
-            <Play size={18} />
-            Start
+          <button onClick={startSession} className="main-btn start-btn" disabled={isRunning}>
+            <Play size={18} /> Start
           </button>
 
-          <button
-            onClick={stopSession}
-            className="main-btn stop-btn"
-          >
-            <Square size={18} />
-            Stop
+          <button onClick={stopSession} className="main-btn stop-btn" disabled={!isRunning}>
+            <Square size={18} /> Stop
           </button>
 
-          <button
-            onClick={downloadPDF}
-            className="main-btn"
-          >
-            <Download size={18} />
-            PDF
+          <button onClick={downloadPDF} className="main-btn">
+            <Download size={18} /> PDF
           </button>
 
-          <button
-            onClick={downloadWord}
-            className="main-btn"
-          >
-            <Download size={18} />
-            Word
+          <button onClick={downloadWord} className="main-btn">
+            <Download size={18} /> Word
           </button>
 
         </div>
 
-        {/* DROPDOWNS + AUDIO — only when stopped */}
         <div className="right-controls">
-
           {!isRunning && (
-
-            <>
-              {/* Previous Sessions */}
-              <select
-                value={selectedFile}
-                onChange={(e) => loadTranscript(e.target.value)}
-                className="dropdown"
-              >
-                <option value="">Previous Transcripts</option>
-                {transcripts.map((session) => (
-                  <option key={session.id} value={session.id}>
-                    {session.label}
-                  </option>
-                ))}
-              </select>
-
-              {/* Download Audio button — only if audio exists */}
-              {audioAvailable && selectedAudio && (
-                <button
-                  onClick={downloadAudio}
-                  className="main-btn audio-dl-btn"
-                >
-                  <Download size={18} />
-                  Download Audio
-                </button>
-              )}
-
-            </>
-
+            <select
+              value={selectedSession}
+              onChange={(e) => loadSession(e.target.value)}
+              className="dropdown"
+            >
+              <option value="">Previous Sessions</option>
+              {sessions.map((s) => (
+                <option key={s.id} value={s.id}>{s.label}</option>
+              ))}
+            </select>
           )}
-
         </div>
-
       </div>
 
       {/* STATUS */}
       <div className="status">
 
         <div className={isRunning ? "status-dot active" : "status-dot"} />
+        <span>{isRunning ? "Translation Running" : "Translation Stopped"}</span>
 
-        <span>
-          {isRunning ? "Translation Running" : "Translation Stopped"}
-        </span>
+        {/* Mic indicator */}
+        <div className={audioSources.includes("mic") ? "audio-dot active" : "audio-dot"} />
+        <Mic size={14} style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }} />
+        <span style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }}>Mic</span>
 
-        <div className={isAudioRecording ? "audio-dot active" : "audio-dot"} />
-
-        <span>
-          {isAudioRecording ? "Audio Recording" : "Audio Stopped"}
-        </span>
+        {/* System audio indicator */}
+        <div className={audioSources.includes("system") ? "audio-dot system active-system" : "audio-dot system"} />
+        <Monitor size={14} style={{ opacity: audioSources.includes("system") ? 1 : 0.4 }} />
+        <span style={{ opacity: audioSources.includes("system") ? 1 : 0.4 }}>System</span>
 
       </div>
 
       {/* TRANSCRIPT */}
       <div className="transcript-container">
-
         <textarea
           ref={textareaRef}
           value={text}
           readOnly
           rows={22}
-          placeholder="Live subtitles..."
+          placeholder="Click Start → allow mic → share screen with audio to begin..."
           className="transcript-box"
         />
-
       </div>
 
     </div>

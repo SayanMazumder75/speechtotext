@@ -1,376 +1,131 @@
-// const express = require("express");
-// const fs = require("fs");
-// const path = require("path");
-// const cors = require("cors");
-// const app = express();
-
-// app.use(cors());
-
-// const TRANSCRIBE_FOLDER = path.join(
-//   __dirname,
-//   "transcribe"
-// );
-
-// const RECORD_FOLDER = path.join(
-//   __dirname,
-//   "Record"
-// );
-
-// app.get("/start-session", (req, res) => {
-
-//   const timestamp = new Date()
-//     .toISOString()
-//     .replace(/[:.]/g, "-");
-
-//   const filename = `transcript_${timestamp}.txt`;
-
-//   const filePath = path.join(
-//     TRANSCRIBE_FOLDER,
-//     filename
-//   );
-
-//   // Create empty transcript file
-//   fs.writeFileSync(filePath, "");
-
-//   // Save current session
-//   fs.writeFileSync(
-//     path.join(
-//       __dirname,
-//       "current_session.txt"
-//     ),
-//     filename
-//   );
-
-//   res.json({ success: true, filename });
-// });
-
-// // -----------------------------------
-// // GET LATEST TRANSCRIPT
-// // -----------------------------------
-// app.get("/transcript", (req, res) => {
-
-//   fs.readdir(
-//     TRANSCRIBE_FOLDER,
-//     (err, files) => {
-
-//       if (err || files.length === 0) {
-//         return res.json({ text: "" });
-//       }
-
-//       // Get latest file
-//       const latestFile = files
-//         .filter(file => file.endsWith(".txt"))
-//         .sort()
-//         .reverse()[0];
-
-//       const filePath = path.join(
-//         TRANSCRIBE_FOLDER,
-//         latestFile
-//       );
-
-//       fs.readFile(
-//         filePath,
-//         "utf8",
-//         (err, data) => {
-
-//           if (err) {
-//             return res.json({ text: "" });
-//           }
-
-//           res.json({ file: latestFile, text: data });
-//         }
-//       );
-//     }
-//   );
-// });
-
-// // -----------------------------------
-// // GET ALL TRANSCRIPTS
-// // -----------------------------------
-// app.get("/transcripts", (req, res) => {
-
-//   fs.readdir(
-//     TRANSCRIBE_FOLDER,
-//     (err, files) => {
-
-//       if (err) {
-//         return res.json([]);
-//       }
-
-//       const transcriptFiles = files
-//         .filter(file => file.endsWith(".txt"))
-//         .sort()
-//         .reverse();
-
-//       res.json(transcriptFiles);
-//     }
-//   );
-// });
-
-// // -----------------------------------
-// // GET SPECIFIC TRANSCRIPT
-// // -----------------------------------
-// app.get("/transcript/:filename", (req, res) => {
-
-//   const filePath = path.join(
-//     TRANSCRIBE_FOLDER,
-//     req.params.filename
-//   );
-
-//   fs.readFile(
-//     filePath,
-//     "utf8",
-//     (err, data) => {
-
-//       if (err) {
-//         return res.status(404).json({
-//           error: "File not found"
-//         });
-//       }
-
-//       res.json({ text: data });
-//     }
-//   );
-// });
-
-// // -----------------------------------
-// // GET ALL AUDIO FILES
-// // -----------------------------------
-// app.get("/audio-files", (req, res) => {
-
-//   if (!fs.existsSync(RECORD_FOLDER)) {
-//     return res.json([]);
-//   }
-
-//   const files = fs.readdirSync(RECORD_FOLDER)
-//     .filter(file => file.endsWith(".wav"))
-//     .sort()
-//     .reverse();
-
-//   res.json(files);
-// });
-
-// // -----------------------------------
-// // ADDED: STREAM AUDIO FILE
-// // Supports range requests so the
-// // browser <audio> player can seek
-// // -----------------------------------
-// app.get("/audio/:filename", (req, res) => {
-
-//   const filePath = path.join(
-//     RECORD_FOLDER,
-//     req.params.filename
-//   );
-
-//   if (!fs.existsSync(filePath)) {
-//     return res.status(404).send("Not found");
-//   }
-
-//   const stat = fs.statSync(filePath);
-//   const range = req.headers.range;
-
-//   if (range) {
-
-//     const parts = range
-//       .replace(/bytes=/, "")
-//       .split("-");
-
-//     const start = parseInt(parts[0], 10);
-
-//     const end = parts[1]
-//       ? parseInt(parts[1], 10)
-//       : stat.size - 1;
-
-//     const chunkSize = end - start + 1;
-
-//     res.writeHead(206, {
-//       "Content-Range": `bytes ${start}-${end}/${stat.size}`,
-//       "Accept-Ranges": "bytes",
-//       "Content-Length": chunkSize,
-//       "Content-Type": "audio/wav",
-//     });
-
-//     fs.createReadStream(filePath, { start, end }).pipe(res);
-
-//   } else {
-
-//     res.writeHead(200, {
-//       "Content-Length": stat.size,
-//       "Content-Type": "audio/wav",
-//       "Accept-Ranges": "bytes",
-//     });
-
-//     fs.createReadStream(filePath).pipe(res);
-//   }
-// });
-
-// app.listen(5000, () => {
-//   console.log(
-//     "Server running on port 5000"
-//   );
-// });
-
 const express = require("express");
 const cors = require("cors");
+const mongoose = require("mongoose");
 
 const app = express();
-
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 // --------------------------------
-// IN-MEMORY STORE
-// sessions = {
-//   sessionId: {
-//     text: "",
-//     audioChunks: [ base64string, ... ]
-//   }
-// }
+// MONGODB CONNECTION
 // --------------------------------
-const sessions = {};
+const MONGO_URI = process.env.MONGO_URI;
+
+mongoose.connect(MONGO_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch(err => console.error("MongoDB error:", err));
 
 // --------------------------------
-// START SESSION (Python recorder)
+// SCHEMA
 // --------------------------------
-app.post("/start-session", (req, res) => {
+const sessionSchema = new mongoose.Schema({
+  session_id: { type: String, required: true, unique: true },
+  text: { type: String, default: "" },
+  createdAt: { type: Date, default: Date.now }
+});
 
-    const { session_id } = req.body;
+const Session = mongoose.model("Session", sessionSchema);
 
-    if (!session_id) {
-        return res.status(400).json({ error: "session_id required" });
-    }
+// --------------------------------
+// START SESSION (Frontend)
+// --------------------------------
+app.post("/start-session", async (req, res) => {
+  const session_id = Date.now().toString();
 
-    sessions[session_id] = {
-        text: "",
-        audioChunks: [],
-        createdAt: new Date().toISOString()
-    };
-
+  try {
+    await Session.create({ session_id });
     console.log(`Session started: ${session_id}`);
-
     res.json({ success: true, session_id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------------------------
-// START SESSION (Frontend button)
+// PUSH TEXT (Frontend sends transcript)
 // --------------------------------
-app.get("/start-session", (req, res) => {
+app.post("/push", async (req, res) => {
+  const { session_id, text } = req.body;
 
-    const session_id = Date.now().toString();
+  if (!session_id || !text) {
+    return res.status(400).json({ error: "session_id and text required" });
+  }
 
-    sessions[session_id] = {
-        text: "",
-        audioChunks: [],
-        createdAt: new Date().toISOString()
-    };
-
-    console.log(`Session started (frontend): ${session_id}`);
-
-    res.json({ success: true, session_id, filename: session_id });
-});
-
-// --------------------------------
-// PUSH — Python sends text + audio chunk
-// --------------------------------
-app.post("/push", (req, res) => {
-
-    const { session_id, text, audio_b64 } = req.body;
-
-    if (!session_id || !sessions[session_id]) {
-        return res.status(404).json({ error: "Session not found" });
-    }
-
-    if (text) {
-        sessions[session_id].text += text + "\n";
-    }
-
-    if (audio_b64) {
-        sessions[session_id].audioChunks.push(audio_b64);
-    }
-
+  try {
+    await Session.findOneAndUpdate(
+      { session_id },
+      { $set: { text: await getAppendedText(session_id, text) } }
+    );
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// --------------------------------
-// GET ALL SESSIONS (transcript list)
-// --------------------------------
-app.get("/transcripts", (req, res) => {
+// Helper: append new text to existing
+async function getAppendedText(session_id, newText) {
+  const session = await Session.findOne({ session_id });
+  if (!session) return newText;
+  return session.text + newText + "\n";
+}
 
-    const list = Object.keys(sessions)
-        .sort()
-        .reverse()
-        .map(id => ({
-            id,
-            label: `Session ${new Date(sessions[id].createdAt).toLocaleTimeString()}`
-        }));
+// --------------------------------
+// GET ALL SESSIONS
+// --------------------------------
+app.get("/transcripts", async (req, res) => {
+  try {
+    const list = await Session.find()
+      .sort({ createdAt: -1 })
+      .select("session_id createdAt");
 
-    res.json(list);
+    res.json(list.map(s => ({
+      id: s.session_id,
+      label: `Session ${new Date(s.createdAt).toLocaleString()}`
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------------------------
 // GET TRANSCRIPT TEXT
 // --------------------------------
-app.get("/transcript/:session_id", (req, res) => {
-
-    const session = sessions[req.params.session_id];
+app.get("/transcript/:session_id", async (req, res) => {
+  try {
+    const session = await Session.findOne({
+      session_id: req.params.session_id
+    });
 
     if (!session) {
-        return res.status(404).json({ error: "Not found" });
+      return res.status(404).json({ error: "Not found" });
     }
 
     res.json({ text: session.text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------------------------
-// DOWNLOAD AUDIO — sends merged WAV
+// DELETE SESSION
 // --------------------------------
-app.get("/audio/:session_id", (req, res) => {
-
-    const session = sessions[req.params.session_id];
-
-    if (!session || session.audioChunks.length === 0) {
-        return res.status(404).json({ error: "No audio found" });
-    }
-
-    const buffers = session.audioChunks.map(b64 =>
-        Buffer.from(b64, "base64")
-    );
-
-    const combined = Buffer.concat(buffers);
-
-    res.setHeader("Content-Type", "audio/wav");
-    res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="session_${req.params.session_id}.wav"`
-    );
-
-    res.send(combined);
+app.delete("/transcript/:session_id", async (req, res) => {
+  try {
+    await Session.findOneAndDelete({
+      session_id: req.params.session_id
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------------------------
-// CHECK AUDIO EXISTS
-// --------------------------------
-app.get("/audio-exists/:session_id", (req, res) => {
-
-    const session = sessions[req.params.session_id];
-
-    const hasAudio = session && session.audioChunks.length > 0;
-
-    res.json({ hasAudio });
-});
-
-// --------------------------------
-// HEALTH CHECK (Render needs this)
+// HEALTH CHECK
 // --------------------------------
 app.get("/", (req, res) => {
-    res.json({
-        status: "ok",
-        sessions: Object.keys(sessions).length
-    });
+  res.json({ status: "ok" });
 });
 
 const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
