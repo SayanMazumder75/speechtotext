@@ -335,170 +335,159 @@ import wave
 import tempfile
 import os
 import requests
-import base64
 import uuid
+import time
 
 recognizer = sr.Recognizer()
 
 # --------------------------------
-# CONFIG — change to your Render URL
+# CONFIG
 # --------------------------------
 CLOUD_URL = "https://speechtotext-060i.onrender.com"
-
-# --------------------------------
-# SESSION ID — unique per run
-# --------------------------------
 SESSION_ID = str(uuid.uuid4())
 
 print(f"\nSession ID: {SESSION_ID}")
 print(f"Cloud URL:  {CLOUD_URL}\n")
 
-# Register session on server
-try:
-    requests.post(
-        f"{CLOUD_URL}/start-session",
-        json={"session_id": SESSION_ID},
-        timeout=10
-    )
-    print("Session started on server.")
-except Exception as e:
-    print(f"Could not connect to server: {e}")
+# --------------------------------
+# REGISTER SESSION WITH RETRY
+# --------------------------------
+def register_session():
+    for attempt in range(5):
+        try:
+            r = requests.post(
+                f"{CLOUD_URL}/start-session",
+                json={"session_id": SESSION_ID},
+                timeout=30  # longer timeout — Render may be waking up
+            )
+            print("Session started on server.")
+            return True
+        except Exception as e:
+            print(f"Connect attempt {attempt+1} failed: {e}")
+            time.sleep(5)
+    print("Could not connect after 5 attempts. Check server.")
+    return False
+
+register_session()
 
 # --------------------------------
 # RECORD SYSTEM AUDIO
 # --------------------------------
 def record_system_audio(seconds=8):
-
     speaker = sc.default_speaker()
-
     mic = sc.get_microphone(
         id=str(speaker.name),
         include_loopback=True
     )
-
     sample_rate = 48000
 
-    with mic.recorder(
-        samplerate=sample_rate,
-        blocksize=1024
-    ) as recorder:
-
-        print(f"\nRecording system audio for {seconds} seconds...")
-
+    with mic.recorder(samplerate=sample_rate, blocksize=1024) as recorder:
+        print(f"\nRecording {seconds}s...")
         frames = []
-
-        for _ in range(
-            0,
-            int(sample_rate / 1024 * seconds)
-        ):
-
+        for _ in range(int(sample_rate / 1024 * seconds)):
             data = recorder.record(numframes=1024)
             frames.append(data)
 
     return np.concatenate(frames), sample_rate
 
 # --------------------------------
-# SAVE WAV TO TEMP FILE
+# SAVE WAV
 # --------------------------------
 def save_wav(data, sample_rate):
-
-    temp_file = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".wav"
-    )
-
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     audio_data = (data * 32767).astype(np.int16)
-
     with wave.open(temp_file.name, 'w') as wf:
         wf.setnchannels(2)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(audio_data.tobytes())
-
     return temp_file.name
 
 # --------------------------------
-# AUDIO → BASE64
-# --------------------------------
-def wav_to_base64(wav_path):
-
-    with open(wav_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-# --------------------------------
-# SPEECH TO TEXT
+# SPEECH TO TEXT WITH RETRY
 # --------------------------------
 def speech_to_text(wav_file):
-
-    try:
-
-        with sr.AudioFile(wav_file) as source:
-            audio = recognizer.record(source)
-            text = recognizer.recognize_google(
-                audio,
-                language="hi-IN"
-            )
-            return text
-
-    except sr.UnknownValueError:
-        print("Could not understand audio")
-        return None
-
-    except sr.RequestError as e:
-        print("Google API Error:", e)
-        return None
-
-    except Exception as e:
-        print("Speech Error:", e)
-        return None
+    for attempt in range(3):
+        try:
+            with sr.AudioFile(wav_file) as source:
+                audio = recognizer.record(source)
+                text = recognizer.recognize_google(
+                    audio,
+                    language="hi-IN"
+                )
+                return text
+        except sr.UnknownValueError:
+            return None  # silence — not an error
+        except sr.RequestError as e:
+            print(f"Google API Error (attempt {attempt+1}): {e}")
+            time.sleep(3)
+        except Exception as e:
+            print(f"Speech Error: {e}")
+            return None
+    return None
 
 # --------------------------------
-# TRANSLATE
+# TRANSLATE WITH RETRY
 # --------------------------------
 def translate_to_english(text):
-
     if not text:
         return None
-
-    try:
-
-        translated = GoogleTranslator(
-            source='auto',
-            target='en'
-        ).translate(text)
-
-        return translated
-
-    except Exception as e:
-        print("Translation Error:", e)
-        return None
+    for attempt in range(3):
+        try:
+            translated = GoogleTranslator(
+                source='auto',
+                target='en'
+            ).translate(text)
+            return translated
+        except Exception as e:
+            print(f"Translation Error (attempt {attempt+1}): {e}")
+            time.sleep(2)
+    return None
 
 # --------------------------------
-# PUSH TO SERVER
+# PUSH TO SERVER WITH RETRY
 # --------------------------------
-def push_to_server(text, audio_b64):
+def push_to_server(text):
+    if not text:
+        return
+    for attempt in range(5):
+        try:
+            requests.post(
+                f"{CLOUD_URL}/push",
+                json={
+                    "session_id": SESSION_ID,
+                    "text": text
+                },
+                timeout=30
+            )
+            return  # success
+        except Exception as e:
+            print(f"Push Error (attempt {attempt+1}): {e}")
+            time.sleep(3)
 
-    try:
+# --------------------------------
+# KEEP SERVER AWAKE (ping every 10 min)
+# --------------------------------
+last_ping = time.time()
 
-        requests.post(
-            f"{CLOUD_URL}/push",
-            json={
-                "session_id": SESSION_ID,
-                "text": text,
-                "audio_b64": audio_b64
-            },
-            timeout=15
-        )
-
-    except Exception as e:
-        print("Push Error:", e)
+def ping_server():
+    global last_ping
+    if time.time() - last_ping > 600:  # 10 minutes
+        try:
+            requests.get(f"{CLOUD_URL}/", timeout=10)
+            last_ping = time.time()
+            print("Server pinged to keep awake.")
+        except:
+            pass
 
 # --------------------------------
 # MAIN LOOP
 # --------------------------------
-while True:
+print("Starting... Press Ctrl+C to stop.\n")
 
+while True:
     try:
+        ping_server()
 
         audio_data, sr_rate = record_system_audio(8)
 
@@ -506,34 +495,32 @@ while True:
 
         original_text = speech_to_text(wav_path)
 
-        # Always encode audio (even if no speech)
-        audio_b64 = wav_to_base64(wav_path)
-
-        # Clean up temp file
-        os.remove(wav_path)
+        # Cleanup temp file
+        try:
+            os.remove(wav_path)
+        except:
+            pass
 
         if not original_text:
-            # Push audio chunk even if no text
-            push_to_server("", audio_b64)
+            print("(silence or unclear)")
             continue
 
-        print("\nOriginal:")
-        print(original_text)
+        print(f"\nOriginal: {original_text}")
 
         english_text = translate_to_english(original_text)
 
         if not english_text:
-            push_to_server("", audio_b64)
+            print("Translation failed, skipping.")
             continue
 
-        print("\nEnglish:")
-        print(english_text)
+        print(f"English:  {english_text}")
 
-        push_to_server(english_text, audio_b64)
+        push_to_server(english_text)
 
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\nStopped by user.")
         break
 
     except Exception as e:
-        print("Main Loop Error:", e)
+        print(f"Main Loop Error: {e}")
+        time.sleep(2)  # wait before retry instead of crashing
