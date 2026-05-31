@@ -28,12 +28,31 @@ function App() {
   const displayStreamRef = useRef(null);
 
   // --------------------------------
-  // PUSH TEXT
+  // TRANSLATE via Google free API
+  // --------------------------------
+  const translateToEnglish = async (txt) => {
+    try {
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(txt)}`;
+      const res = await axios.get(url);
+      const translated = res.data[0]
+        .map(chunk => chunk[0])
+        .join(" ")
+        .trim();
+      return translated;
+    } catch (err) {
+      console.error("Translation error:", err);
+      return txt; // fallback: return original
+    }
+  };
+
+  // --------------------------------
+  // PUSH TEXT (translate first then push)
   // --------------------------------
   const pushText = async (txt, sid) => {
     if (!txt || !sid) return;
     try {
-      await axios.post(`${API}/push`, { session_id: sid, text: txt });
+      const english = await translateToEnglish(txt);
+      await axios.post(`${API}/push`, { session_id: sid, text: english });
     } catch (err) {
       console.error("Push error:", err);
     }
@@ -214,6 +233,7 @@ function App() {
   // LOAD OLD SESSION
   // --------------------------------
   const loadSession = async (sid) => {
+    if (!sid) return; // guard empty selection
     try {
       setSelectedSession(sid);
       const res = await axios.get(`${API}/transcript/${sid}`);
