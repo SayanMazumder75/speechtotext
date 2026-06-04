@@ -89,8 +89,9 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       contentType: req.file.mimetype || "audio/webm",
     });
     formData.append("model", "whisper-large-v3");
-    formData.append("task", "translate"); // translate → always outputs English
-    formData.append("language", "hi");    // hint: Hindi/multilingual input
+    formData.append("response_format", "json");
+    // Groq Whisper auto-detects language and transcribes
+    // No "task" param supported — translation handled by server below
 
     const whisperRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
       method: "POST",
@@ -108,8 +109,22 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       return res.status(500).json({ error: whisperData.error.message });
     }
 
-    const transcript = whisperData.text?.trim();
-    console.log(`[${session_id}] Whisper: ${transcript}`);
+    let transcript = whisperData.text?.trim();
+    console.log(`[${session_id}] Whisper raw: ${transcript}`);
+
+    // Translate to English using Google free API
+    if (transcript) {
+      try {
+        const translateRes = await fetch(
+          `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(transcript)}`
+        );
+        const translateData = await translateRes.json();
+        transcript = translateData[0].map(c => c[0]).join(" ").trim();
+        console.log(`[${session_id}] Translated: ${transcript}`);
+      } catch (e) {
+        console.log("Translation failed, using original");
+      }
+    }
 
     if (transcript) {
       const session = await Session.findOne({ session_id });
