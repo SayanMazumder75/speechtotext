@@ -279,24 +279,115 @@ function App() {
   };
 
   // ── DOWNLOAD HELPERS ───────────────────────────────────────────────────────
-  const getSmartText = () =>
-    smartBlocks
-      .filter(b => !b.summarising && b.text)
-      .map(b => `[${b.type.toUpperCase()}] ${b.text}`)
-      .join("\n");
+  const getSmartText = () => {
+
+  const paragraphs = [];
+
+  let currentSystem = [];
+
+  smartBlocks.forEach((block) => {
+
+    if (block.type === "mic") {
+
+      if (currentSystem.length) {
+
+        paragraphs.push(
+          currentSystem.join(" ")
+        );
+
+        currentSystem = [];
+      }
+
+      paragraphs.push(
+        block.text
+      );
+
+    } else {
+
+      if (
+        !block.summarising &&
+        block.text
+      ) {
+
+        currentSystem.push(
+          block.text
+        );
+      }
+    }
+  });
+
+  if (currentSystem.length) {
+
+    paragraphs.push(
+      currentSystem.join(" ")
+    );
+  }
+
+  return paragraphs.join("\n\n");
+};
 
   const downloadPDF = () => {
-    const doc = new jsPDF();
-    const lines = doc.splitTextToSize(getSmartText(), 180);
-    doc.text(lines, 10, 10);
-    doc.save("transcript.pdf");
-  };
 
-  const downloadWord = async () => {
-    const doc = new Document({ sections: [{ properties: {}, children: [new Paragraph(getSmartText())] }] });
-    const blob = await Packer.toBlob(doc);
-    saveAs(blob, "transcript.docx");
-  };
+  const doc = new jsPDF();
+
+  const text =
+    getSmartText();
+
+  const lines =
+    doc.splitTextToSize(
+      text,
+      170
+    );
+
+  doc.setFont(
+    "helvetica",
+    "normal"
+  );
+
+  doc.setFontSize(12);
+
+  doc.text(
+    lines,
+    15,
+    20
+  );
+
+  doc.save(
+    "Smart_Transcript.pdf"
+  );
+};
+
+  const downloadWord =
+  async () => {
+
+    const doc =
+      new Document({
+
+        sections: [
+          {
+            children:
+              getSmartText()
+                .split("\n\n")
+                .map(
+                  txt =>
+                    new Paragraph(
+                      txt
+                    )
+                )
+          }
+        ]
+      });
+
+    const blob =
+      await Packer.toBlob(
+        doc
+      );
+
+    saveAs(
+      blob,
+      "Smart_Transcript.docx"
+    );
+};
 
   // ── AUTO SCROLL ────────────────────────────────────────────────────────────
   useEffect(() => {
