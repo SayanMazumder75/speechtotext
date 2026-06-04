@@ -88,14 +88,14 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       filename: "audio.webm",
       contentType: req.file.mimetype || "audio/webm",
     });
-    formData.append("model", "whisper-1");
+    formData.append("model", "whisper-large-v3");
     formData.append("task", "translate"); // translate → always outputs English
     formData.append("language", "hi");    // hint: Hindi/multilingual input
 
-    const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const whisperRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
         ...formData.getHeaders(),
       },
       body: formData,
