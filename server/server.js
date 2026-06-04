@@ -8,6 +8,7 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -29,7 +30,7 @@ const Session = mongoose.model("Session", sessionSchema);
 // START SESSION (POST - Python/Frontend)
 // --------------------------------
 app.post("/start-session", async (req, res) => {
-  const session_id = req.body.session_id || Date.now().toString();
+  const session_id = (req.body && req.body.session_id) ? req.body.session_id : Date.now().toString();
   try {
     await Session.create({ session_id });
     console.log(`Session started: ${session_id}`);
