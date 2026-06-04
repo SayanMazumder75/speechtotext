@@ -59,17 +59,15 @@ function App() {
   };
 
   // --------------------------------
-  // CREATE FRESH RECOGNITION INSTANCE
-  // Called every time recognition ends
-  // so browser gets a brand new object
+  // RECOGNITION FACTORY
+  // label = "mic" or "system" for logging
+  // onEndCallback = what to do on end
   // --------------------------------
-  const createAndStartRecognition = (sid) => {
-    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
-    if (!SpeechRecognition) return;
+  const makeRecognition = (sid, label, onEndCallback) => {
+    if (!SpeechRecognition) return null;
 
-    // Always create NEW instance — never reuse old one
     const rec = new SpeechRecognition();
-    rec.continuous = false; // false = more stable across browsers
+    rec.continuous = false;
     rec.interimResults = false;
     rec.lang = "hi-IN";
 
@@ -79,6 +77,7 @@ function App() {
         .map(r => r[0].transcript)
         .join(" ");
       if (transcript) {
+        console.log(`[${label}] ${transcript}`);
         pushText(transcript, sid);
       }
     };
@@ -87,24 +86,94 @@ function App() {
       if (e.error === "not-allowed") {
         setErrorMsg("Mic permission denied. Allow mic in browser settings.");
         stopSession();
-        return;
       }
-      // All other errors (aborted, no-speech, network) — just restart
+      // other errors — onend will handle restart
     };
 
     rec.onend = () => {
-      // Restart with fresh instance after short delay
       if (isRunningRef.current && sessionIdRef.current === sid) {
-        setTimeout(() => createAndStartRecognition(sid), 200);
+        setTimeout(onEndCallback, 200);
       }
     };
+
+    return rec;
+  };
+
+  // --------------------------------
+  // MIC RECOGNITION LOOP
+  // --------------------------------
+  const createAndStartRecognition = (sid) => {
+    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
+
+    const rec = makeRecognition(sid, "mic", () => createAndStartRecognition(sid));
+    if (!rec) return;
 
     try {
       rec.start();
       recognitionRef.current = rec;
     } catch (e) {
-      // If start fails wait and retry
       setTimeout(() => createAndStartRecognition(sid), 500);
+    }
+  };
+
+  // --------------------------------
+  // SYSTEM AUDIO RECOGNITION LOOP
+  // Uses AudioContext to pipe display
+  // stream into a new MediaStream that
+  // SpeechRecognition can consume
+  // --------------------------------
+  const sysRecognitionRef = useRef(null);
+  const audioCtxRef = useRef(null);
+
+  const createAndStartSysRecognition = (sid, displayStream) => {
+    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
+    if (!SpeechRecognition) return;
+
+    try {
+      // Build audio pipeline: displayStream → AudioContext → dest → SpeechRecognition
+      const audioCtx = new AudioContext();
+      audioCtxRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(displayStream);
+      const dest = audioCtx.createMediaStreamDestination();
+      source.connect(dest);
+
+      const rec = new SpeechRecognition();
+      rec.continuous = false;
+      rec.interimResults = false;
+      rec.lang = "hi-IN";
+
+      rec.onresult = (e) => {
+        const transcript = Array.from(e.results)
+          .filter(r => r.isFinal)
+          .map(r => r[0].transcript)
+          .join(" ");
+        if (transcript) {
+          console.log(`[system] ${transcript}`);
+          pushText(transcript, sid);
+        }
+      };
+
+      rec.onerror = (e) => {
+        // system audio errors — just restart
+        console.log("System rec error:", e.error);
+      };
+
+      rec.onend = () => {
+        if (
+          isRunningRef.current &&
+          sessionIdRef.current === sid &&
+          displayStream.active
+        ) {
+          setTimeout(() => createAndStartSysRecognition(sid, displayStream), 200);
+        }
+      };
+
+      rec.start();
+      sysRecognitionRef.current = rec;
+
+    } catch (e) {
+      console.error("System recognition setup failed:", e);
     }
   };
 
@@ -146,9 +215,22 @@ function App() {
 
         if (displayStream.getAudioTracks().length > 0) {
           setAudioSources(["mic", "system"]);
+
+          // START system audio recognition
+          createAndStartSysRecognition(newSessionId, displayStream);
+
           displayStream.getAudioTracks()[0].onended = () => {
             setAudioSources(prev => prev.filter(s => s !== "system"));
             displayStreamRef.current = null;
+            // Stop system recognition cleanly
+            if (sysRecognitionRef.current) {
+              try { sysRecognitionRef.current.abort(); } catch(e) {}
+              sysRecognitionRef.current = null;
+            }
+            if (audioCtxRef.current) {
+              audioCtxRef.current.close();
+              audioCtxRef.current = null;
+            }
           };
         } else {
           displayStream.getTracks().forEach(t => t.stop());
@@ -176,6 +258,16 @@ function App() {
     if (recognitionRef.current) {
       try { recognitionRef.current.abort(); } catch (e) {}
       recognitionRef.current = null;
+    }
+
+    if (sysRecognitionRef.current) {
+      try { sysRecognitionRef.current.abort(); } catch (e) {}
+      sysRecognitionRef.current = null;
+    }
+
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close();
+      audioCtxRef.current = null;
     }
 
     if (displayStreamRef.current) {
