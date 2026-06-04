@@ -22,10 +22,16 @@ function App() {
   const [errorMsg, setErrorMsg] = useState("");
 
   const textareaRef = useRef(null);
-  const recognitionRef = useRef(null);
   const sessionIdRef = useRef("");
   const isRunningRef = useRef(false);
+
+  // Mic recognition refs
+  const recognitionRef = useRef(null);
+
+  // System audio refs
   const displayStreamRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
 
   // --------------------------------
   // TRANSLATE via Google free API
@@ -34,19 +40,15 @@ function App() {
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(txt)}`;
       const res = await axios.get(url);
-      const translated = res.data[0]
-        .map(chunk => chunk[0])
-        .join(" ")
-        .trim();
+      const translated = res.data[0].map(chunk => chunk[0]).join(" ").trim();
       return translated;
-    } catch (err) {
-      console.error("Translation error:", err);
-      return txt; // fallback: return original
+    } catch {
+      return txt;
     }
   };
 
   // --------------------------------
-  // PUSH TEXT (translate first then push)
+  // PUSH TEXT (mic — translate first)
   // --------------------------------
   const pushText = async (txt, sid) => {
     if (!txt || !sid) return;
@@ -59,12 +61,30 @@ function App() {
   };
 
   // --------------------------------
-  // RECOGNITION FACTORY
-  // label = "mic" or "system" for logging
-  // onEndCallback = what to do on end
+  // SEND AUDIO CHUNK TO WHISPER
+  // System audio path — no translation
+  // needed, Whisper task=translate does it
   // --------------------------------
-  const makeRecognition = (sid, label, onEndCallback) => {
-    if (!SpeechRecognition) return null;
+  const sendAudioChunk = async (blob, sid) => {
+    if (!blob || blob.size < 1000 || !sid) return; // skip tiny/empty chunks
+    try {
+      const formData = new FormData();
+      formData.append("audio", blob, "audio.webm");
+      formData.append("session_id", sid);
+      await axios.post(`${API}/transcribe`, formData, {
+        headers: { "Content-Type": "multipart/form-data" }
+      });
+    } catch (err) {
+      console.error("Transcribe error:", err);
+    }
+  };
+
+  // --------------------------------
+  // MIC RECOGNITION LOOP
+  // --------------------------------
+  const createAndStartRecognition = (sid) => {
+    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
+    if (!SpeechRecognition) return;
 
     const rec = new SpeechRecognition();
     rec.continuous = false;
@@ -77,104 +97,83 @@ function App() {
         .map(r => r[0].transcript)
         .join(" ");
       if (transcript) {
-        console.log(`[${label}] ${transcript}`);
+        console.log("[mic]", transcript);
         pushText(transcript, sid);
       }
     };
 
     rec.onerror = (e) => {
       if (e.error === "not-allowed") {
-        setErrorMsg("Mic permission denied. Allow mic in browser settings.");
+        setErrorMsg("Mic permission denied.");
         stopSession();
       }
-      // other errors — onend will handle restart
     };
 
     rec.onend = () => {
       if (isRunningRef.current && sessionIdRef.current === sid) {
-        setTimeout(onEndCallback, 200);
+        setTimeout(() => createAndStartRecognition(sid), 200);
       }
     };
-
-    return rec;
-  };
-
-  // --------------------------------
-  // MIC RECOGNITION LOOP
-  // --------------------------------
-  const createAndStartRecognition = (sid) => {
-    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
-
-    const rec = makeRecognition(sid, "mic", () => createAndStartRecognition(sid));
-    if (!rec) return;
 
     try {
       rec.start();
       recognitionRef.current = rec;
-    } catch (e) {
+    } catch {
       setTimeout(() => createAndStartRecognition(sid), 500);
     }
   };
 
   // --------------------------------
-  // SYSTEM AUDIO RECOGNITION LOOP
-  // Uses AudioContext to pipe display
-  // stream into a new MediaStream that
-  // SpeechRecognition can consume
+  // SYSTEM AUDIO via MediaRecorder
+  // Sends chunks to Whisper every 5s
   // --------------------------------
-  const sysRecognitionRef = useRef(null);
-  const audioCtxRef = useRef(null);
+  const startSystemAudio = (sid, displayStream) => {
+    if (!displayStream || displayStream.getAudioTracks().length === 0) return;
 
-  const createAndStartSysRecognition = (sid, displayStream) => {
-    if (!isRunningRef.current || sessionIdRef.current !== sid) return;
-    if (!SpeechRecognition) return;
+    audioChunksRef.current = [];
 
-    try {
-      // Build audio pipeline: displayStream → AudioContext → dest → SpeechRecognition
-      const audioCtx = new AudioContext();
-      audioCtxRef.current = audioCtx;
+    // Use audio-only stream for recording
+    const audioStream = new MediaStream(displayStream.getAudioTracks());
 
-      const source = audioCtx.createMediaStreamSource(displayStream);
-      const dest = audioCtx.createMediaStreamDestination();
-      source.connect(dest);
+    // Pick best supported format
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
 
-      const rec = new SpeechRecognition();
-      rec.continuous = false;
-      rec.interimResults = false;
-      rec.lang = "hi-IN";
+    const recorder = new MediaRecorder(audioStream, { mimeType });
 
-      rec.onresult = (e) => {
-        const transcript = Array.from(e.results)
-          .filter(r => r.isFinal)
-          .map(r => r[0].transcript)
-          .join(" ");
-        if (transcript) {
-          console.log(`[system] ${transcript}`);
-          pushText(transcript, sid);
-        }
-      };
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        audioChunksRef.current.push(e.data);
+      }
+    };
 
-      rec.onerror = (e) => {
-        // system audio errors — just restart
-        console.log("System rec error:", e.error);
-      };
+    recorder.onstop = async () => {
+      if (audioChunksRef.current.length > 0) {
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        audioChunksRef.current = [];
+        await sendAudioChunk(blob, sid);
+      }
 
-      rec.onend = () => {
-        if (
-          isRunningRef.current &&
-          sessionIdRef.current === sid &&
-          displayStream.active
-        ) {
-          setTimeout(() => createAndStartSysRecognition(sid, displayStream), 200);
-        }
-      };
+      // Restart if still running
+      if (isRunningRef.current && sessionIdRef.current === sid && displayStream.active) {
+        audioChunksRef.current = [];
+        recorder.start();
+        setTimeout(() => {
+          if (recorder.state === "recording") recorder.stop();
+        }, 5000);
+      }
+    };
 
-      rec.start();
-      sysRecognitionRef.current = rec;
+    mediaRecorderRef.current = recorder;
+    recorder.start();
 
-    } catch (e) {
-      console.error("System recognition setup failed:", e);
-    }
+    // Stop every 5s to send chunk
+    setTimeout(() => {
+      if (recorder.state === "recording") recorder.stop();
+    }, 5000);
+
+    console.log("[system] MediaRecorder started");
   };
 
   // --------------------------------
@@ -182,10 +181,9 @@ function App() {
   // --------------------------------
   const startSession = async () => {
     if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome on desktop. Web Speech API not supported here.");
+      setErrorMsg("Use Chrome on desktop.");
       return;
     }
-
     setErrorMsg("");
 
     try {
@@ -201,51 +199,43 @@ function App() {
       setIsRunning(true);
       setAudioSources(["mic"]);
 
-      // Start fresh recognition
+      // Start mic recognition
       createAndStartRecognition(newSessionId);
 
-      // Try system audio (optional)
+      // Try system audio
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,  // must be true for Chrome to allow audio
+          video: true,
           audio: { echoCancellation: false, noiseSuppression: false }
         });
 
-        // Stop video track immediately — only need audio
+        // Stop video immediately — only need audio
         displayStream.getVideoTracks().forEach(t => t.stop());
 
         displayStreamRef.current = displayStream;
 
         if (displayStream.getAudioTracks().length > 0) {
           setAudioSources(["mic", "system"]);
-
-          // START system audio recognition
-          createAndStartSysRecognition(newSessionId, displayStream);
+          startSystemAudio(newSessionId, displayStream);
 
           displayStream.getAudioTracks()[0].onended = () => {
             setAudioSources(prev => prev.filter(s => s !== "system"));
             displayStreamRef.current = null;
-            // Stop system recognition cleanly
-            if (sysRecognitionRef.current) {
-              try { sysRecognitionRef.current.abort(); } catch(e) {}
-              sysRecognitionRef.current = null;
-            }
-            if (audioCtxRef.current) {
-              audioCtxRef.current.close();
-              audioCtxRef.current = null;
+            if (mediaRecorderRef.current?.state === "recording") {
+              mediaRecorderRef.current.stop();
             }
           };
         } else {
           displayStream.getTracks().forEach(t => t.stop());
-          setErrorMsg("Tip: tick 'Share audio' when sharing screen for system audio. Mic still active.");
+          setErrorMsg("Tip: tick 'Share tab audio' in screen share dialog.");
         }
       } catch {
-        // User cancelled screen share — mic still works fine
+        // User cancelled — mic still works
       }
 
     } catch (err) {
       console.error(err);
-      setErrorMsg("Failed to start session. Check server connection.");
+      setErrorMsg("Failed to start. Check server.");
       isRunningRef.current = false;
       setIsRunning(false);
     }
@@ -259,18 +249,13 @@ function App() {
     sessionIdRef.current = "";
 
     if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch (e) {}
+      try { recognitionRef.current.abort(); } catch {}
       recognitionRef.current = null;
     }
 
-    if (sysRecognitionRef.current) {
-      try { sysRecognitionRef.current.abort(); } catch (e) {}
-      sysRecognitionRef.current = null;
-    }
-
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close();
-      audioCtxRef.current = null;
+    if (mediaRecorderRef.current?.state === "recording") {
+      try { mediaRecorderRef.current.stop(); } catch {}
+      mediaRecorderRef.current = null;
     }
 
     if (displayStreamRef.current) {
@@ -290,9 +275,7 @@ function App() {
       try {
         const res = await axios.get(`${API}/transcripts`);
         setSessions(res.data);
-      } catch (err) {
-        console.error(err);
-      }
+      } catch {}
     }, 3000);
     return () => clearInterval(interval);
   }, []);
@@ -307,9 +290,7 @@ function App() {
         try {
           const res = await axios.get(`${API}/transcript/${sessionId}`);
           setText(res.data.text);
-        } catch (err) {
-          console.error(err);
-        }
+        } catch {}
       }, 2000);
     }
     return () => clearInterval(interval);
@@ -328,14 +309,12 @@ function App() {
   // LOAD OLD SESSION
   // --------------------------------
   const loadSession = async (sid) => {
-    if (!sid) return; // guard empty selection
+    if (!sid) return;
     try {
       setSelectedSession(sid);
       const res = await axios.get(`${API}/transcript/${sid}`);
       setText(res.data.text);
-    } catch (err) {
-      console.error(err);
-    }
+    } catch {}
   };
 
   const downloadPDF = () => {
@@ -352,9 +331,6 @@ function App() {
     saveAs(blob, "translation.docx");
   };
 
-  // --------------------------------
-  // UI
-  // --------------------------------
   return (
     <div className={darkMode ? "app dark" : "app"}>
 
@@ -400,9 +376,7 @@ function App() {
         </div>
       </div>
 
-      {errorMsg && (
-        <div className="error-msg">⚠️ {errorMsg}</div>
-      )}
+      {errorMsg && <div className="error-msg">⚠️ {errorMsg}</div>}
 
       <div className="status">
         <div className={isRunning ? "status-dot active" : "status-dot"} />
@@ -423,7 +397,7 @@ function App() {
           value={text}
           readOnly
           rows={22}
-          placeholder="Click Start → allow mic → optionally share screen with audio..."
+          placeholder="Click Start → allow mic → share screen with audio for system capture..."
           className="transcript-box"
         />
       </div>
