@@ -365,7 +365,7 @@ function App() {
       {/* SPLIT PANELS */}
       <div className="panels">
 
-        {/* LEFT — Smart Transcript */}
+        {/* LEFT — Smart Transcript (clean prose) */}
         <div className="panel">
           <div className="panel-header">
             <span className="panel-title">Smart Transcript</span>
@@ -373,29 +373,58 @@ function App() {
               <Zap size={11} /> AI Summary
             </span>
           </div>
-          <div className="transcript-container tagged-container">
-            <div className="tagged-list" ref={smartListRef}>
+          <div className="transcript-container">
+            <div className="smart-prose-container" ref={smartListRef}>
               {smartBlocks.length === 0 && (
                 <p className="tagged-placeholder">
-                  System audio will be summarised into single sentences.<br />
-                  Mic interruptions appear instantly as spoken.
+                  System audio will be summarised into flowing sentences.<br />
+                  Mic interruptions appear on a new line.
                 </p>
               )}
-              {smartBlocks.map((block, i) => (
-                <div key={block.id ?? i} className={`smart-block block-${block.type} ${block.summarising ? "block-loading" : ""}`}>
-                  <span className={`source-badge badge-${block.type}`}>
-                    {block.type === "mic"
-                      ? <><Mic size={11} /> mic</>
-                      : <><Monitor size={11} /> system</>}
-                  </span>
-                  {block.summarising
-                    ? <span className="entry-text summarising-text">
-                        <span className="dot-pulse" />
-                        Summarising…
-                      </span>
-                    : <span className="entry-text">{block.text}</span>}
-                </div>
-              ))}
+
+              {/* Render: group consecutive system blocks inline, mic = new paragraph */}
+              {(() => {
+                // Build display paragraphs from smartBlocks
+                // Each "paragraph" is an array of blocks that share a visual line
+                // A mic block always starts its own paragraph
+                const paragraphs = [];
+                let currentGroup = [];
+
+                smartBlocks.forEach((block, i) => {
+                  if (block.type === "mic") {
+                    if (currentGroup.length) { paragraphs.push({ type: "system", blocks: currentGroup }); currentGroup = []; }
+                    paragraphs.push({ type: "mic", blocks: [block] });
+                  } else {
+                    currentGroup.push(block);
+                  }
+                });
+                if (currentGroup.length) paragraphs.push({ type: "system", blocks: currentGroup });
+
+                return paragraphs.map((para, pi) => {
+                  if (para.type === "mic") {
+                    const block = para.blocks[0];
+                    return (
+                      <p key={block.id ?? pi} className="prose-mic">
+                        {block.text}
+                      </p>
+                    );
+                  }
+                  // system group — render as one prose paragraph
+                  // summarising blocks show a pulse inline
+                  return (
+                    <p key={pi} className="prose-system">
+                      {para.blocks.map((block, bi) => (
+                        <span key={block.id ?? bi}>
+                          {block.summarising
+                            ? <span className="prose-summarising"><span className="dot-pulse" /> summarising…</span>
+                            : <span>{block.text}{bi < para.blocks.length - 1 ? " " : ""}</span>
+                          }
+                        </span>
+                      ))}
+                    </p>
+                  );
+                });
+              })()}
             </div>
           </div>
         </div>

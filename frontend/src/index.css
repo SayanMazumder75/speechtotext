@@ -352,60 +352,87 @@ h1 { font-size: 56px; margin: 0 0 10px; }
   .transcript-container { height: 400px; }
 }
 
-/* ─── SMART TRANSCRIPT BLOCKS ─────────────────────────────────────── */
+/* ─── SMART TRANSCRIPT — PROSE VIEW ──────────────────────────────── */
 
-.smart-block {
+.smart-prose-container {
+  height: 100%;
+  overflow-y: auto;
+  padding: 8px 4px;
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 12px 14px;
-  border-radius: 14px;
-  font-size: 15px;
-  line-height: 1.6;
-  animation: fadeSlideIn 0.25s ease;
-  transition: background 0.3s ease, border 0.3s ease;
+  flex-direction: column;
+  gap: 0;
 }
 
-/* System block — uses same purple as before */
-.block-system {
-  background: rgba(168, 85, 247, 0.08);
-  border: 1px solid rgba(168, 85, 247, 0.2);
+/* System audio: flowing paragraph, normal weight */
+.prose-system {
+  margin: 0 0 2px 0;
+  font-size: 17px;
+  line-height: 1.85;
+  color: inherit;
+  opacity: 0.92;
 }
 
-/* Mic block — uses amber */
-.block-mic {
-  background: rgba(245, 158, 11, 0.08);
-  border: 1px solid rgba(245, 158, 11, 0.2);
+/* Mic interruption: new paragraph, slightly bolder + accent colour */
+.prose-mic {
+  margin: 14px 0 4px 0;
+  font-size: 17px;
+  line-height: 1.85;
+  font-weight: 600;
+  color: #fbbf24;        /* amber — matches mic badge colour */
+  position: relative;
+  padding-left: 14px;
 }
 
-/* Loading / summarising state */
-.block-loading {
-  background: rgba(168, 85, 247, 0.04);
-  border: 1px dashed rgba(168, 85, 247, 0.35);
-  opacity: 0.75;
+/* Subtle left bar on mic lines */
+.prose-mic::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 4px;
+  background: #fbbf24;
+  opacity: 0.55;
 }
 
-/* "Summarising…" text row */
-.summarising-text {
+/* Dark mode mic text stays amber; light mode keep readable */
+.app:not(.dark) .prose-mic {
+  color: #b45309;
+}
+.app:not(.dark) .prose-mic::before {
+  background: #b45309;
+}
+
+/* Inline "summarising…" pulse inside prose */
+.prose-summarising {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-style: italic;
-  opacity: 0.6;
-  font-size: 14px;
+  opacity: 0.45;
+  font-size: 15px;
 }
 
-/* Animated three-dot pulse */
+/* Three-dot pulse */
 .dot-pulse {
   display: inline-block;
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: #a855f7;
   animation: pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
 }
 
 @keyframes pulse {
   0%, 100% { opacity: 0.2; transform: scale(0.8); }
   50%       { opacity: 1;   transform: scale(1.2); }
+}
+
+/* Scrollbar */
+.smart-prose-container::-webkit-scrollbar { width: 6px; }
+.smart-prose-container::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.15);
+  border-radius: 20px;
 }
