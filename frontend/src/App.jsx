@@ -7,9 +7,7 @@ import { Moon, Sun, Play, Square, Download, Mic, Monitor } from "lucide-react";
 import "./index.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
-
-const SpeechRecognition =
-  window.SpeechRecognition || window.webkitSpeechRecognition;
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 function App() {
   const [text, setText] = useState("");
@@ -21,14 +19,14 @@ function App() {
   const [audioSources, setAudioSources] = useState([]);
   const [errorMsg, setErrorMsg] = useState("");
 
+  // Tagged entries for the split panel: [{ source: "mic"|"system", text: "..." }]
+  const [taggedEntries, setTaggedEntries] = useState([]);
+
   const textareaRef = useRef(null);
+  const taggedListRef = useRef(null);
   const sessionIdRef = useRef("");
   const isRunningRef = useRef(false);
-
-  // Mic recognition refs
   const recognitionRef = useRef(null);
-
-  // System audio refs
   const displayStreamRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
@@ -40,20 +38,21 @@ function App() {
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(txt)}`;
       const res = await axios.get(url);
-      const translated = res.data[0].map(chunk => chunk[0]).join(" ").trim();
-      return translated;
+      return res.data[0].map(chunk => chunk[0]).join(" ").trim();
     } catch {
       return txt;
     }
   };
 
   // --------------------------------
-  // PUSH TEXT (mic — translate first)
+  // PUSH TEXT (mic)
   // --------------------------------
   const pushText = async (txt, sid) => {
     if (!txt || !sid) return;
+    const english = await translateToEnglish(txt);
+    // Add to tagged entries locally
+    setTaggedEntries(prev => [...prev, { source: "mic", text: english }]);
     try {
-      const english = await translateToEnglish(txt);
       await axios.post(`${API}/push`, { session_id: sid, text: english });
     } catch (err) {
       console.error("Push error:", err);
@@ -61,19 +60,21 @@ function App() {
   };
 
   // --------------------------------
-  // SEND AUDIO CHUNK TO WHISPER
-  // System audio path — no translation
-  // needed, Whisper task=translate does it
+  // SEND AUDIO CHUNK TO WHISPER (system)
   // --------------------------------
   const sendAudioChunk = async (blob, sid) => {
-    if (!blob || blob.size < 1000 || !sid) return; // skip tiny/empty chunks
+    if (!blob || blob.size < 1000 || !sid) return;
     try {
       const formData = new FormData();
       formData.append("audio", blob, "audio.webm");
       formData.append("session_id", sid);
-      await axios.post(`${API}/transcribe`, formData, {
+      const res = await axios.post(`${API}/transcribe`, formData, {
         headers: { "Content-Type": "multipart/form-data" }
       });
+      const transcribed = res.data?.text;
+      if (transcribed) {
+        setTaggedEntries(prev => [...prev, { source: "system", text: transcribed }]);
+      }
     } catch (err) {
       console.error("Transcribe error:", err);
     }
@@ -125,17 +126,12 @@ function App() {
 
   // --------------------------------
   // SYSTEM AUDIO via MediaRecorder
-  // Sends chunks to Whisper every 5s
   // --------------------------------
   const startSystemAudio = (sid, displayStream) => {
     if (!displayStream || displayStream.getAudioTracks().length === 0) return;
 
     audioChunksRef.current = [];
-
-    // Use audio-only stream for recording
     const audioStream = new MediaStream(displayStream.getAudioTracks());
-
-    // Pick best supported format
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
       : "audio/webm";
@@ -143,9 +139,7 @@ function App() {
     const recorder = new MediaRecorder(audioStream, { mimeType });
 
     recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
-        audioChunksRef.current.push(e.data);
-      }
+      if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
     };
 
     recorder.onstop = async () => {
@@ -154,8 +148,6 @@ function App() {
         audioChunksRef.current = [];
         await sendAudioChunk(blob, sid);
       }
-
-      // Restart if still running
       if (isRunningRef.current && sessionIdRef.current === sid && displayStream.active) {
         audioChunksRef.current = [];
         recorder.start();
@@ -167,24 +159,18 @@ function App() {
 
     mediaRecorderRef.current = recorder;
     recorder.start();
-
-    // Stop every 5s to send chunk
     setTimeout(() => {
       if (recorder.state === "recording") recorder.stop();
     }, 5000);
-
-    console.log("[system] MediaRecorder started");
   };
 
   // --------------------------------
   // START SESSION
   // --------------------------------
   const startSession = async () => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome on desktop.");
-      return;
-    }
+    if (!SpeechRecognition) { setErrorMsg("Use Chrome on desktop."); return; }
     setErrorMsg("");
+    setTaggedEntries([]);
 
     try {
       const res = await axios.post(`${API}/start-session`);
@@ -192,32 +178,25 @@ function App() {
 
       sessionIdRef.current = newSessionId;
       isRunningRef.current = true;
-
       setSessionId(newSessionId);
       setSelectedSession(newSessionId);
       setText("");
       setIsRunning(true);
       setAudioSources(["mic"]);
 
-      // Start mic recognition
       createAndStartRecognition(newSessionId);
 
-      // Try system audio
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: { echoCancellation: false, noiseSuppression: false }
         });
-
-        // Stop video immediately — only need audio
         displayStream.getVideoTracks().forEach(t => t.stop());
-
         displayStreamRef.current = displayStream;
 
         if (displayStream.getAudioTracks().length > 0) {
           setAudioSources(["mic", "system"]);
           startSystemAudio(newSessionId, displayStream);
-
           displayStream.getAudioTracks()[0].onended = () => {
             setAudioSources(prev => prev.filter(s => s !== "system"));
             displayStreamRef.current = null;
@@ -232,7 +211,6 @@ function App() {
       } catch {
         // User cancelled — mic still works
       }
-
     } catch (err) {
       console.error(err);
       setErrorMsg("Failed to start. Check server.");
@@ -252,12 +230,10 @@ function App() {
       try { recognitionRef.current.abort(); } catch {}
       recognitionRef.current = null;
     }
-
     if (mediaRecorderRef.current?.state === "recording") {
       try { mediaRecorderRef.current.stop(); } catch {}
       mediaRecorderRef.current = null;
     }
-
     if (displayStreamRef.current) {
       displayStreamRef.current.getTracks().forEach(t => t.stop());
       displayStreamRef.current = null;
@@ -281,7 +257,7 @@ function App() {
   }, []);
 
   // --------------------------------
-  // LIVE FETCH TEXT
+  // LIVE FETCH TEXT (left panel)
   // --------------------------------
   useEffect(() => {
     let interval;
@@ -305,13 +281,20 @@ function App() {
     }
   }, [text]);
 
+  useEffect(() => {
+    if (taggedListRef.current) {
+      taggedListRef.current.scrollTop = taggedListRef.current.scrollHeight;
+    }
+  }, [taggedEntries]);
+
   // --------------------------------
   // LOAD OLD SESSION
   // --------------------------------
   const loadSession = async (sid) => {
     if (!sid) return;
+    setSelectedSession(sid);
+    setTaggedEntries([]);
     try {
-      setSelectedSession(sid);
       const res = await axios.get(`${API}/transcript/${sid}`);
       setText(res.data.text);
     } catch {}
@@ -334,6 +317,7 @@ function App() {
   return (
     <div className={darkMode ? "app dark" : "app"}>
 
+      {/* HEADER */}
       <div className="header">
         <div>
           <h1>AI Live Translator</h1>
@@ -344,6 +328,7 @@ function App() {
         </button>
       </div>
 
+      {/* CONTROLS */}
       <div className="controls">
         <div className="left-controls">
           <button onClick={startSession} className="main-btn start-btn" disabled={isRunning}>
@@ -359,7 +344,6 @@ function App() {
             <Download size={18} /> Word
           </button>
         </div>
-
         <div className="right-controls">
           {!isRunning && (
             <select
@@ -378,6 +362,7 @@ function App() {
 
       {errorMsg && <div className="error-msg">⚠️ {errorMsg}</div>}
 
+      {/* STATUS */}
       <div className="status">
         <div className={isRunning ? "status-dot active" : "status-dot"} />
         <span>{isRunning ? "Translation Running" : "Translation Stopped"}</span>
@@ -391,17 +376,58 @@ function App() {
         <span style={{ opacity: audioSources.includes("system") ? 1 : 0.4 }}>System</span>
       </div>
 
-      <div className="transcript-container">
-        <textarea
-          ref={textareaRef}
-          value={text}
-          readOnly
-          rows={22}
-          placeholder="Click Start → allow mic → share screen with audio for system capture..."
-          className="transcript-box"
-        />
-      </div>
+      {/* SPLIT PANELS */}
+      <div className="panels">
 
+        {/* LEFT — plain transcript (existing) */}
+        <div className="panel">
+          <div className="panel-header">
+            <span className="panel-title">Full Transcript</span>
+            <span className="panel-badge combined">Combined</span>
+          </div>
+          <div className="transcript-container">
+            <textarea
+              ref={textareaRef}
+              value={text}
+              readOnly
+              placeholder="Click Start → allow mic → share screen with audio..."
+              className="transcript-box"
+            />
+          </div>
+        </div>
+
+        {/* RIGHT — tagged feed */}
+        <div className="panel">
+          <div className="panel-header">
+            <span className="panel-title">Live Feed</span>
+            <span className="panel-badge live">
+              {isRunning ? "● Live" : "Paused"}
+            </span>
+          </div>
+          <div className="transcript-container tagged-container">
+            <div className="tagged-list" ref={taggedListRef}>
+              {taggedEntries.length === 0 && (
+                <p className="tagged-placeholder">
+                  Tagged entries will appear here when running…
+                </p>
+              )}
+              {taggedEntries.map((entry, i) => (
+                <div key={i} className={`tagged-entry entry-${entry.source}`}>
+                  <span className={`source-badge badge-${entry.source}`}>
+                    {entry.source === "mic" ? (
+                      <><Mic size={11} /> mic</>
+                    ) : (
+                      <><Monitor size={11} /> system</>
+                    )}
+                  </span>
+                  <span className="entry-text">{entry.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+      </div>
     </div>
   );
 }
