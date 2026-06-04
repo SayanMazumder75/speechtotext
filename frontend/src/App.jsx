@@ -207,9 +207,12 @@ function App() {
       // Try system audio (optional)
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: false,
+          video: true,  // must be true for Chrome to allow audio
           audio: { echoCancellation: false, noiseSuppression: false }
         });
+
+        // Stop video track immediately — only need audio
+        displayStream.getVideoTracks().forEach(t => t.stop());
 
         displayStreamRef.current = displayStream;
 
