@@ -23,6 +23,15 @@ const sessionSchema = new mongoose.Schema({
 });
 const Session = mongoose.model("Session", sessionSchema);
 
+function formatTimestamp() {
+  return new Date().toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
 // --------------------------------
 // GROQ KEY ROTATION
 // --------------------------------
@@ -167,13 +176,14 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     console.log(`[${session_id}][${source}] translated: ${english}`);
 
     // Save to DB
-    const tagged = `[${(source || "system").toUpperCase()}] ${english}`;
+    const timestamp = formatTimestamp();
+    const tagged = `[${(source || "system").toUpperCase()}] [${timestamp}] ${english}`;
     const session = await Session.findOne({ session_id });
     if (session) {
       await Session.findOneAndUpdate({ session_id }, { text: session.text + tagged + "\n" });
     }
 
-    res.json({ text: english });
+    res.json({ text: english, timestamp });
   } catch (err) {
     console.error("Transcribe error:", err);
     res.status(500).json({ error: err.message });

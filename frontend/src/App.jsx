@@ -9,6 +9,9 @@ import {
   Mic,
   Monitor
 } from "lucide-react";
+import { createReportData } from "./utils/transcriptFormatter";
+import { exportPDF } from "./utils/exportPdf";
+import { exportWord } from "./utils/exportWord";
 import "./index.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
@@ -24,7 +27,11 @@ function App() {
   const [sessionId, setSessionId] = useState("");
   const [audioSources, setAudioSources] = useState([]);
   const [errorMsg, setErrorMsg] = useState("");
+  const [systemAudioTip, setSystemAudioTip] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
   const [inputLang, setInputLang] = useState("bn-IN");
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [sessionSeconds, setSessionSeconds] = useState(0);
 
   const combinedRef = useRef(null);
   const micRef = useRef(null);
@@ -32,6 +39,7 @@ function App() {
   const sessionIdRef = useRef("");
   const isRunningRef = useRef(false);
   const inputLangRef = useRef("bn-IN");
+  const sessionStartAtRef = useRef(0);
 
   const recognitionRef = useRef(null);
 
@@ -39,9 +47,84 @@ function App() {
   const systemChunksRef = useRef([]);
   const displayStreamRef = useRef(null);
 
+  const captureModeLabel = !isRunning
+    ? "Idle"
+    : audioSources.includes("mic") && audioSources.includes("system")
+      ? "Mic + system audio"
+      : audioSources.includes("mic")
+        ? "Mic only"
+        : "Starting...";
+
+  const formatTime = (timestamp) =>
+    timestamp.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+
+  const formatDuration = (seconds) => {
+    const safeSeconds = Math.max(0, seconds);
+    const hours = Math.floor(safeSeconds / 3600);
+    const minutes = Math.floor((safeSeconds % 3600) / 60);
+    const remainingSeconds = safeSeconds % 60;
+    const parts = [minutes, remainingSeconds].map((value) => String(value).padStart(2, "0"));
+    return hours > 0 ? `${hours}:${parts[0]}:${parts[1]}` : `${parts[0]}:${parts[1]}`;
+  };
+
+  const parseTranscriptLine = (line) => {
+    const timestampedMatch = line.match(/^\[(MIC|SYSTEM)\]\s+\[(.*?)\]\s*(.*)$/);
+    if (timestampedMatch) {
+      return {
+        source: timestampedMatch[1].toLowerCase(),
+        timestamp: timestampedMatch[2],
+        text: timestampedMatch[3] || ""
+      };
+    }
+
+    if (line.startsWith("[MIC] ")) {
+      return { source: "mic", timestamp: "", text: line.replace("[MIC] ", "") };
+    }
+
+    if (line.startsWith("[SYSTEM] ")) {
+      return { source: "system", timestamp: "", text: line.replace("[SYSTEM] ", "") };
+    }
+
+    return { source: "system", timestamp: "", text: line };
+  };
+
+  const formatTranscriptLine = (line) =>
+    line.timestamp
+      ? `[${line.source.toUpperCase()}] [${line.timestamp}] ${line.text}`
+      : `[${line.source.toUpperCase()}] ${line.text}`;
+
+  const filteredSessions = sessions.filter((session) =>
+    session.label.toLowerCase().includes(sessionQuery.toLowerCase()) ||
+    session.id.toLowerCase().includes(sessionQuery.toLowerCase())
+  );
+
   useEffect(() => {
     inputLangRef.current = inputLang;
   }, [inputLang]);
+
+  useEffect(() => {
+    if (!isRunning) {
+      sessionSeconds && setSessionSeconds(0);
+      sessionStartAtRef.current = 0;
+      return;
+    }
+
+    sessionStartAtRef.current = Date.now();
+    setSessionSeconds(0);
+
+    const timer = setInterval(() => {
+      setSessionSeconds(
+        Math.floor((Date.now() - sessionStartAtRef.current) / 1000)
+      );
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [isRunning]);
 
   const translateToEnglish = async (text, sourceLang) => {
     if (!text) return "";
@@ -74,7 +157,14 @@ function App() {
       });
 
       if (res.data.text) {
-        setLines((prev) => [...prev, { source: "system", text: res.data.text }]);
+        setLines((prev) => [
+          ...prev,
+          {
+            source: "system",
+            text: res.data.text,
+            timestamp: res.data.timestamp || formatTime(new Date())
+          }
+        ]);
       }
     } catch (err) {
       console.error("Transcribe error:", err);
@@ -110,12 +200,14 @@ function App() {
 
       console.log("[mic english]", english);
 
-      setLines((prev) => [...prev, { source: "mic", text: english }]);
+      const timestamp = formatTime(new Date());
+
+      setLines((prev) => [...prev, { source: "mic", text: english, timestamp }]);
 
       try {
         await axios.post(`${API}/push`, {
           session_id: sid,
-          text: `[MIC] ${english}`
+          text: `[MIC] [${timestamp}] ${english}`
         });
       } catch {}
     };
@@ -190,6 +282,8 @@ function App() {
     }
 
     setErrorMsg("");
+    setSystemAudioTip("");
+    setCopyStatus("");
     setLines([]);
 
     try {
@@ -218,6 +312,7 @@ function App() {
         displayStreamRef.current = displayStream;
 
         if (displayStream.getAudioTracks().length > 0) {
+          setSystemAudioTip("");
           setAudioSources(["mic", "system"]);
           startSystemAudio(newSessionId, displayStream);
 
@@ -230,13 +325,14 @@ function App() {
           };
         } else {
           displayStream.getTracks().forEach((t) => t.stop());
-          setErrorMsg("Tip: tick 'Share tab audio' in screen share dialog.");
+          setSystemAudioTip("Tip: tick 'Share tab audio' in the screen share dialog.");
         }
       } catch {
       }
     } catch (err) {
       console.error(err);
       setErrorMsg("Failed to start. Check server.");
+      setSystemAudioTip("");
       isRunningRef.current = false;
       setIsRunning(false);
     }
@@ -267,6 +363,7 @@ function App() {
 
     setIsRunning(false);
     setAudioSources([]);
+    setSystemAudioTip("");
   };
 
   useEffect(() => {
@@ -284,19 +381,12 @@ function App() {
     if (!sid) return;
     try {
       setSelectedSession(sid);
+      setSessionQuery("");
       const res = await axios.get(`${API}/transcript/${sid}`);
       const parsed = res.data.text
         .split("\n")
         .filter((l) => l.trim())
-        .map((l) => {
-          if (l.startsWith("[MIC] ")) {
-            return { source: "mic", text: l.replace("[MIC] ", "") };
-          }
-          if (l.startsWith("[SYSTEM] ")) {
-            return { source: "system", text: l.replace("[SYSTEM] ", "") };
-          }
-          return { source: "system", text: l };
-        });
+        .map(parseTranscriptLine);
 
       setLines(parsed);
     } catch {}
@@ -309,44 +399,48 @@ function App() {
   }, [lines]);
 
   const downloadPDF = async () => {
-    const { default: jsPDF } = await import("jspdf");
-    const doc = new jsPDF();
-    const text = lines.map((l) => `[${l.source.toUpperCase()}] ${l.text}`).join("\n");
-    const split = doc.splitTextToSize(text, 170);
-    doc.text(split, 15, 20);
-    doc.save("transcript.pdf");
+    const sessionName = selectedSession || sessionId || "Current Session";
+    const report = createReportData(lines, sessionName);
+    report.summary = "";
+    exportPDF(report);
+  };
+
+  const copyTranscript = async () => {
+    const text = lines.map(formatTranscriptLine).join("\n");
+    if (!text) return;
+
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyStatus("Transcript copied to clipboard.");
+      setTimeout(() => setCopyStatus(""), 2000);
+    } catch {
+      setCopyStatus("Copy failed. Please try again.");
+      setTimeout(() => setCopyStatus(""), 2000);
+    }
   };
 
   const downloadWord = async () => {
-    const { Document, Packer, Paragraph } = await import("docx");
-    const { saveAs } = await import("file-saver");
-
-    const doc = new Document({
-      sections: [
-        {
-          children: lines.map(
-            (l) => new Paragraph(`[${l.source.toUpperCase()}] ${l.text}`)
-          )
-        }
-      ]
-    });
-
-    const blob = await Packer.toBlob(doc);
-    saveAs(blob, "transcript.docx");
+    const sessionName = selectedSession || sessionId || "Current Session";
+    const report = createReportData(lines, sessionName);
+    report.summary = "";
+    await exportWord(report);
   };
 
-  const renderTagged = (filterFn, ref) => (
+  const renderTagged = (filterFn, ref, emptyMessage) => (
     <div className="transcript-scroll" ref={ref}>
       {lines.filter(filterFn).map((l, i) => (
         <div key={i} className={`transcript-line ${l.source}`}>
-          <span className={`tag tag-${l.source}`}>
-            {l.source === "mic" ? "🎤 MIC" : "🖥 SYS"}
-          </span>
+          <div className="line-meta">
+            <span className={`tag tag-${l.source}`}>
+              {l.source === "mic" ? "🎤 MIC" : "🖥 SYS"}
+            </span>
+            <span className="line-time">{l.timestamp || "--:--:--"}</span>
+          </div>
           <span className="line-text">{l.text}</span>
         </div>
       ))}
       {lines.filter(filterFn).length === 0 && (
-        <p className="empty-hint">Transcript will appear here...</p>
+        <p className="empty-hint">{emptyMessage}</p>
       )}
     </div>
   );
@@ -356,7 +450,9 @@ function App() {
       return (
         <div className="transcript-scroll" ref={ref}>
           <p className="empty-hint">
-            All transcript appears here as flowing text...
+            {isRunning
+              ? "Live transcript will appear here as soon as audio is captured."
+              : "Start a session to see the combined transcript here."}
           </p>
         </div>
       );
@@ -421,49 +517,88 @@ function App() {
             <Square size={18} /> Stop
           </button>
 
-          <button onClick={downloadPDF} className="main-btn">
+          <button onClick={downloadPDF} className="main-btn" disabled={isRunning}>
             <Download size={18} /> PDF
           </button>
 
-          <button onClick={downloadWord} className="main-btn">
+          <button onClick={downloadWord} className="main-btn" disabled={isRunning}>
             <Download size={18} /> Word
           </button>
-        </div>
 
-        <div className="right-controls">
-          <select
-            value={inputLang}
-            onChange={(e) => setInputLang(e.target.value)}
-            className="dropdown"
+          <button
+            onClick={copyTranscript}
+            className="main-btn copy-btn"
             disabled={isRunning}
           >
-            <option value="bn-IN">Bengali</option>
-            <option value="hi-IN">Hindi</option>
-            <option value="en-IN">English</option>
-          </select>
+            Copy Transcript
+          </button>
+        </div>
+        <div className="right-controls">
+          <div className="dropdown-group">
+            <div className="dropdown-label">Mic audio language</div>
+            <select
+              value={inputLang}
+              onChange={(e) => setInputLang(e.target.value)}
+              className="dropdown"
+              disabled={isRunning}
+            >
+              <option value="bn-IN">Bengali</option>
+              <option value="hi-IN">Hindi</option>
+              <option value="en-IN">English</option>
+            </select>
+          </div>
+
+          <div className="dropdown-hint">Affects microphone transcription only.</div>
 
           {!isRunning && (
-            <select
-              value={selectedSession}
-              onChange={(e) => loadSession(e.target.value)}
-              className="dropdown"
-            >
-              <option value="">Previous Sessions</option>
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.label}
-                </option>
-              ))}
-            </select>
+            <>
+              <div className="dropdown-group">
+                <div className="dropdown-label">Search sessions</div>
+                <input
+                  type="search"
+                  value={sessionQuery}
+                  onChange={(e) => setSessionQuery(e.target.value)}
+                  className="dropdown search-input"
+                  placeholder="Type to filter sessions"
+                />
+              </div>
+
+              <select
+                value={selectedSession}
+                onChange={(e) => loadSession(e.target.value)}
+                className="dropdown"
+              >
+                <option value="">Previous Sessions</option>
+                {filteredSessions.length > 0 ? (
+                  filteredSessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.label}
+                    </option>
+                  ))
+                ) : (
+                  <option value="" disabled>
+                    No matching sessions
+                  </option>
+                )}
+              </select>
+            </>
           )}
         </div>
       </div>
 
       {errorMsg && <div className="error-msg">⚠️ {errorMsg}</div>}
 
+      {systemAudioTip && <div className="tip-msg">{systemAudioTip}</div>}
+
+      {copyStatus && <div className="copy-msg">{copyStatus}</div>}
+
       <div className="status">
         <div className={isRunning ? "status-dot active" : "status-dot"} />
         <span>{isRunning ? "Translation Running" : "Translation Stopped"}</span>
+
+        <div className="status-badge">Mode: {captureModeLabel}</div>
+
+        <div className="status-badge timer-badge">Timer: {formatDuration(sessionSeconds)}</div>
 
         <div
           className={audioSources.includes("mic") ? "audio-dot active" : "audio-dot"}
@@ -495,6 +630,18 @@ function App() {
         </span>
       </div>
 
+      <div className="status-legend">
+        <span className="legend-item">
+          <span className="legend-dot legend-running" /> Running
+        </span>
+        <span className="legend-item">
+          <span className="legend-dot legend-mic" /> Mic
+        </span>
+        <span className="legend-item">
+          <span className="legend-dot legend-system" /> System
+        </span>
+      </div>
+
       <div className="panels">
         <div className="panel">
           <div className="panel-header combined-header">📋 All</div>
@@ -505,14 +652,28 @@ function App() {
           <div className="panel-header mic-header">
             <Mic size={14} /> Microphone
           </div>
-          {renderTagged((l) => l.source === "mic", micRef)}
+          {renderTagged(
+            (l) => l.source === "mic",
+            micRef,
+            isRunning
+              ? "Waiting for microphone input..."
+              : "Start a session to capture microphone text here."
+          )}
         </div>
 
         <div className="panel">
           <div className="panel-header sys-header">
             <Monitor size={14} /> System Audio
           </div>
-          {renderTagged((l) => l.source === "system", sysRef)}
+          {renderTagged(
+            (l) => l.source === "system",
+            sysRef,
+            isRunning
+              ? audioSources.includes("system")
+                ? "Waiting for system audio text..."
+                : "Share tab audio to populate this panel."
+              : "Start a session and share tab audio to capture system text here."
+          )}
         </div>
       </div>
     </div>
