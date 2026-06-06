@@ -25,7 +25,8 @@ const sessionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 const Session = mongoose.model("Session", sessionSchema);
-
+mongoose.connection.on('connected', () => console.log('MongoDB connected'));
+mongoose.connection.on('error', (err) => console.error('MongoDB connection error:', err));
 // --------------------------------
 // LOAD BALANCING FOR GROQ API KEYS
 // --------------------------------
@@ -159,7 +160,13 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       console.log(`[${session_id}] Duplicate line ignored: ${originalText}`);
       return res.json({ text: "" });
     }
-    recentTranscripts.set(cacheKey, originalText);
+    // After setting the cache, schedule deletion after 10 seconds
+recentTranscripts.set(cacheKey, originalText);
+setTimeout(() => {
+  if (recentTranscripts.get(cacheKey) === originalText) {
+    recentTranscripts.delete(cacheKey);
+  }
+}, 10000);
     // Optional: auto‑clear after 10 seconds (but not critical)
 
     // Step 4: Translate to English
@@ -217,11 +224,15 @@ app.post("/summarise", async (req, res) => {
 // SESSION ROUTES (unchanged)
 // --------------------------------
 app.post("/start-session", async (req, res) => {
-  const session_id = req.body.session_id || Date.now().toString();
+  const session_id = req.body?.session_id || Date.now().toString();
   try {
+    console.log("Creating session with ID:", session_id);
     await Session.create({ session_id });
+    console.log("Session created successfully");
     res.json({ success: true, session_id });
   } catch (err) {
+    console.error("ERROR in /start-session:", err.message);
+    console.error(err.stack);
     res.status(500).json({ error: err.message });
   }
 });
