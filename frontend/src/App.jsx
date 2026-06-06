@@ -5,6 +5,17 @@ import { saveAs } from "file-saver";
 import { Document, Packer, Paragraph } from "docx";
 import { Moon, Sun, Play, Square, Download, Mic, Monitor } from "lucide-react";
 import "./index.css";
+import {
+  createReportData
+} from "./utils/transcriptFormatter";
+
+import {
+  exportPDF
+} from "./utils/exportPdf";
+
+import {
+  exportWord
+} from "./utils/exportWord";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -257,18 +268,29 @@ function App() {
   const fullText = lines.map(l => `[${l.source.toUpperCase()}] ${l.text}`).join("\n");
 
   const downloadPDF = () => {
-    const doc = new jsPDF();
-    doc.text(fullText, 10, 10);
-    doc.save("translation.pdf");
-  };
 
-  const downloadWord = async () => {
-    const doc = new Document({
-      sections: [{ properties: {}, children: lines.map(l => new Paragraph(`[${l.source.toUpperCase()}] ${l.text}`)) }]
-    });
-    const blob = await Packer.toBlob(doc);
-    saveAs(blob, "translation.docx");
-  };
+  const report =
+    createReportData(
+      lines,
+      selectedSession
+    );
+
+  exportPDF(report);
+};
+
+  const downloadWord =
+  async () => {
+
+    const report =
+      createReportData(
+        lines,
+        selectedSession
+      );
+
+    await exportWord(
+      report
+    );
+};
 
   // --------------------------------
   // PANEL RENDERER — tagged (mic/system)
