@@ -310,3 +310,35 @@ h1 { font-size: 56px; margin: 0 0 10px; }
   .panels { grid-template-columns: 1fr; }
   .transcript-scroll { height: 350px; }
 }
+
+/* =====================
+   PROSE VIEW (All panel)
+   ===================== */
+.prose-scroll {
+  display: block !important;
+  font-size: 17px;
+  line-height: 1.9;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* System text — normal inline */
+.prose-sys-text {
+  color: inherit;
+  opacity: 0.9;
+}
+
+/* Mic text — amber, block */
+.prose-mic-text {
+  color: #fbbf24;
+  font-weight: 600;
+  display: block;
+  margin: 10px 0 4px 0;
+  padding-left: 12px;
+  border-left: 3px solid #fbbf24;
+  opacity: 0.95;
+}
+.app:not(.dark) .prose-mic-text {
+  color: #b45309;
+  border-left-color: #b45309;
+}

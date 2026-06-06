@@ -271,9 +271,9 @@ function App() {
   };
 
   // --------------------------------
-  // PANEL RENDERER
+  // PANEL RENDERER — tagged (mic/system)
   // --------------------------------
-  const renderLines = (filterFn, ref) => (
+  const renderTagged = (filterFn, ref) => (
     <div className="transcript-scroll" ref={ref}>
       {lines.filter(filterFn).map((l, i) => (
         <div key={i} className={`transcript-line ${l.source}`}>
@@ -282,14 +282,49 @@ function App() {
         </div>
       ))}
       {lines.filter(filterFn).length === 0 && (
-        <p className="empty-hint">
-          {filterFn({ source: "mic" })
-            ? "Mic transcript will appear here..."
-            : "System audio transcript will appear here..."}
-        </p>
+        <p className="empty-hint">Transcript will appear here...</p>
       )}
     </div>
   );
+
+  // --------------------------------
+  // ALL PANEL — prose view
+  // system lines = flowing paragraph
+  // mic lines = new line, amber color
+  // --------------------------------
+  const renderProse = (ref) => {
+    if (lines.length === 0) return (
+      <div className="transcript-scroll" ref={ref}>
+        <p className="empty-hint">All transcript will appear here as flowing text...</p>
+      </div>
+    );
+
+    // Group consecutive system lines into paragraphs
+    const groups = [];
+    lines.forEach((l) => {
+      if (l.source === "mic") {
+        groups.push({ type: "mic", text: l.text });
+      } else {
+        // append to last system group or create new one
+        const last = groups[groups.length - 1];
+        if (last && last.type === "system") {
+          last.text += " " + l.text;
+        } else {
+          groups.push({ type: "system", text: l.text });
+        }
+      }
+    });
+
+    return (
+      <div className="transcript-scroll prose-scroll" ref={ref}>
+        {groups.map((g, i) =>
+          g.type === "system"
+            ? <span key={i} className="prose-sys-text">{g.text} </span>
+            : <div key={i} className="prose-mic-text">{g.text}</div>
+        )}
+      </div>
+    );
+  };
 
   // --------------------------------
   // UI
@@ -348,22 +383,22 @@ function App() {
       {/* THREE PANELS */}
       <div className="panels">
 
-        {/* COMBINED */}
+        {/* COMBINED — prose */}
         <div className="panel">
           <div className="panel-header combined-header">📋 All</div>
-          {renderLines(() => true, combinedRef)}
+          {renderProse(combinedRef)}
         </div>
 
         {/* MIC ONLY */}
         <div className="panel">
           <div className="panel-header mic-header"><Mic size={14} /> Microphone</div>
-          {renderLines(l => l.source === "mic", micRef)}
+          {renderTagged(l => l.source === "mic", micRef)}
         </div>
 
         {/* SYSTEM ONLY */}
         <div className="panel">
           <div className="panel-header sys-header"><Monitor size={14} /> System Audio</div>
-          {renderLines(l => l.source === "system", sysRef)}
+          {renderTagged(l => l.source === "system", sysRef)}
         </div>
 
       </div>
