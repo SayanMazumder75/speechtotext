@@ -27,7 +27,84 @@ const sessionSchema = new mongoose.Schema({
 const Session = mongoose.model("Session", sessionSchema);
 
 // --------------------------------
-// START SESSION (POST - Python/Frontend)
+// LOAD BALANCING FOR GROQ API KEYS
+// --------------------------------
+const groqApiKeys = [
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3,
+  process.env.GROQ_API_KEY_4
+].filter(key => key && key.trim() !== "");
+
+let currentKeyIndex = 0;
+
+function getNextGroqKey() {
+  if (groqApiKeys.length === 0) {
+    throw new Error("No Groq API keys configured");
+  }
+  const key = groqApiKeys[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % groqApiKeys.length;
+  return key;
+}
+
+async function callGroqWhisper(audioBuffer, mimeType, maxRetries = groqApiKeys.length) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const apiKey = getNextGroqKey();
+    try {
+      const formData = new FormData();
+      formData.append("file", audioBuffer, {
+        filename: "audio.webm",
+        contentType: mimeType || "audio/webm",
+      });
+      formData.append("model", "whisper-large-v3");
+      formData.append("response_format", "json");
+      formData.append("task", "translate");   // translate any language to English
+
+      const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          ...formData.getHeaders(),
+        },
+        body: formData,
+      });
+
+      if (response.status === 429) {
+        console.warn(`Rate limit hit for key ${apiKey.slice(0,5)}..., trying next`);
+        continue; // try next key
+      }
+
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message);
+      }
+      let transcript = data.text?.trim() || "";
+      // Filter common hallucinations
+      const HALLUCINATIONS = [
+        "thank you", "thanks", "bye", "goodbye", "you", "no", "yes",
+        "okay", "ok", "hmm", "um", "uh", "ah", "oh", ".", "...", " ",
+        "subscribe", "like", "share", "please", "welcome", "hello"
+      ];
+      if (transcript && HALLUCINATIONS.some(h =>
+        transcript.toLowerCase().trim() === h.toLowerCase()
+      )) {
+        return "";
+      }
+      if (transcript && transcript.split(" ").length <= 1 && transcript.length < 8) {
+        return "";
+      }
+      return transcript;
+    } catch (err) {
+      console.error(`Attempt ${attempt+1} failed with key ${apiKey?.slice(0,5)}:`, err.message);
+      lastError = err;
+    }
+  }
+  throw new Error(`All Groq keys failed: ${lastError?.message}`);
+}
+
+// --------------------------------
+// START SESSION (POST)
 // --------------------------------
 app.post("/start-session", async (req, res) => {
   const session_id = (req.body && req.body.session_id) ? req.body.session_id : Date.now().toString();
@@ -54,7 +131,7 @@ app.get("/start-session", async (req, res) => {
 });
 
 // --------------------------------
-// PUSH TEXT
+// PUSH TEXT (manual lines)
 // --------------------------------
 app.post("/push", async (req, res) => {
   const { session_id, text } = req.body;
@@ -73,85 +150,26 @@ app.post("/push", async (req, res) => {
 });
 
 // --------------------------------
-// WHISPER TRANSCRIBE + TRANSLATE
+// TRANSCRIBE (receives audio from browser)
 // --------------------------------
 app.post("/transcribe", upload.single("audio"), async (req, res) => {
-  const { session_id } = req.body;
-
+  const { session_id, source } = req.body;
   if (!session_id) return res.status(400).json({ error: "session_id required" });
   if (!req.file) return res.status(400).json({ error: "audio file required" });
 
   try {
-    const formData = new FormData();
-    formData.append("file", req.file.buffer, {
-      filename: "audio.webm",
-      contentType: req.file.mimetype || "audio/webm",
-    });
-    formData.append("model", "whisper-large-v3");
-    formData.append("response_format", "json");
-
-    const whisperRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        ...formData.getHeaders(),
-      },
-      body: formData,
-    });
-
-    const whisperData = await whisperRes.json();
-
-    if (whisperData.error) {
-      console.error("Whisper error:", whisperData.error);
-      return res.status(500).json({ error: whisperData.error.message });
-    }
-
-    let transcript = whisperData.text?.trim();
-    console.log(`[${session_id}] Whisper raw: ${transcript}`);
-
-    // Filter Whisper hallucinations
-    const HALLUCINATIONS = [
-      "thank you", "thanks", "bye", "goodbye", "you", "no", "yes",
-      "okay", "ok", "hmm", "um", "uh", "ah", "oh", ".", "...", " ",
-      "subscribe", "like", "share", "please", "welcome", "hello"
-    ];
-    if (transcript && HALLUCINATIONS.some(h =>
-      transcript.toLowerCase().trim() === h.toLowerCase()
-    )) {
-      console.log(`[${session_id}] Hallucination filtered: ${transcript}`);
-      return res.json({ text: "" });
-    }
-    if (transcript && transcript.split(" ").length <= 1 && transcript.length < 8) {
-      console.log(`[${session_id}] Too short, filtered: ${transcript}`);
-      return res.json({ text: "" });
-    }
-
-    // Translate to English
+    const transcript = await callGroqWhisper(req.file.buffer, req.file.mimetype);
     if (transcript) {
-      try {
-        const translateRes = await fetch(
-          `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(transcript)}`
-        );
-        const translateData = await translateRes.json();
-        transcript = translateData[0].map(c => c[0]).join(" ").trim();
-        console.log(`[${session_id}] Translated: ${transcript}`);
-      } catch (e) {
-        console.log("Translation failed, using original");
-      }
-    }
-
-    if (transcript) {
+      const tagged = `[${source?.toUpperCase() || "SYSTEM"}] ${transcript}`;
       const session = await Session.findOne({ session_id });
       if (session) {
         await Session.findOneAndUpdate(
           { session_id },
-          { text: session.text + transcript + "\n" }
+          { text: session.text + tagged + "\n" }
         );
       }
     }
-
     res.json({ text: transcript || "" });
-
   } catch (err) {
     console.error("Transcribe error:", err);
     res.status(500).json({ error: err.message });
@@ -159,17 +177,19 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
 });
 
 // --------------------------------
-// SUMMARISE via Groq (only one version kept)
+// SUMMARISE via Groq (LLaMA)
 // --------------------------------
 app.post("/summarise", async (req, res) => {
   const { text } = req.body;
   if (!text) return res.json({ summary: "" });
 
   try {
+    // Use the same load balancing for summarisation? For simplicity, use first key.
+    const apiKey = groqApiKeys[0];
     const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
@@ -212,7 +232,7 @@ app.get("/transcripts", async (req, res) => {
 });
 
 // --------------------------------
-// GET TRANSCRIPT
+// GET SINGLE TRANSCRIPT
 // --------------------------------
 app.get("/transcript/:session_id", async (req, res) => {
   try {
@@ -225,7 +245,7 @@ app.get("/transcript/:session_id", async (req, res) => {
 });
 
 // --------------------------------
-// HEALTH
+// HEALTH CHECK
 // --------------------------------
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
