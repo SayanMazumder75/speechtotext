@@ -2,11 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import { Moon, Sun, Play, Square, Download, Mic, Monitor } from "lucide-react";
 import "./index.css";
-import { createReportData } from "./utils/transcriptFormatter";
-import { exportPDF } from "./utils/exportPdf";
-import { exportWord } from "./utils/exportWord";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 function App() {
   const [lines, setLines] = useState([]);
@@ -24,80 +22,98 @@ function App() {
   const sessionIdRef = useRef("");
   const isRunningRef = useRef(false);
 
-  // MediaRecorder references
-  const micMediaRecorderRef = useRef(null);
+  // Mic — Web Speech API
+  const recognitionRef = useRef(null);
+
+  // System — MediaRecorder
   const systemMediaRecorderRef = useRef(null);
-  const micChunksRef = useRef([]);
   const systemChunksRef = useRef([]);
-  const micStreamRef = useRef(null);
   const displayStreamRef = useRef(null);
 
   // --------------------------------
-  // SEND AUDIO CHUNK to Whisper
+  // SEND SYSTEM AUDIO CHUNK → Whisper
   // --------------------------------
-  const sendAudioChunk = async (blob, sid, source) => {
+  const sendAudioChunk = async (blob, sid) => {
     if (!blob || blob.size < 1000 || !sid) return;
     try {
       const formData = new FormData();
       formData.append("audio", blob, "audio.webm");
       formData.append("session_id", sid);
-      formData.append("source", source);
+      formData.append("source", "system");
       const res = await axios.post(`${API}/transcribe`, formData, {
         headers: { "Content-Type": "multipart/form-data" }
       });
       if (res.data.text) {
-        setLines(prev => [...prev, { source, text: res.data.text }]);
+        setLines(prev => [...prev, { source: "system", text: res.data.text }]);
       }
     } catch (err) {
-      console.error(`Transcribe error (${source}):`, err);
+      console.error("Transcribe error:", err);
     }
   };
 
   // --------------------------------
-  // MICROPHONE CAPTURE (continuous)
+  // MIC — Web Speech API (instant response)
   // --------------------------------
-  const startMicrophoneAudio = async (sid) => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus" : "audio/webm";
-
-      const recorder = new MediaRecorder(stream, { mimeType });
-      micMediaRecorderRef.current = recorder;
-      micChunksRef.current = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data?.size > 0) micChunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = async () => {
-        if (micChunksRef.current.length > 0) {
-          const blob = new Blob(micChunksRef.current, { type: mimeType });
-          micChunksRef.current = [];
-          await sendAudioChunk(blob, sid, "mic");
-        }
-        if (isRunningRef.current && sessionIdRef.current === sid) {
-          micChunksRef.current = [];
-          recorder.start();
-          setTimeout(() => {
-            if (recorder.state === "recording") recorder.stop();
-          }, 5000);
-        }
-      };
-
-      recorder.start();
-      setTimeout(() => {
-        if (recorder.state === "recording") recorder.stop();
-      }, 5000);
-    } catch (err) {
-      console.error("Microphone error:", err);
-      setErrorMsg("Could not access microphone. Please allow permissions.");
+  const startMicRecognition = (sid) => {
+    if (!SpeechRecognition) {
+      setErrorMsg("Use Chrome — Web Speech API not supported.");
+      return;
     }
+
+    const rec = new SpeechRecognition();
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = "hi-IN";
+
+    rec.onresult = async (e) => {
+      const transcript = Array.from(e.results)
+        .filter(r => r.isFinal)
+        .map(r => r[0].transcript)
+        .join(" ").trim();
+
+      if (!transcript) return;
+      console.log("[mic]", transcript);
+
+      // Translate
+      let english = transcript;
+      try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(transcript)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        english = data[0].map(c => c[0]).join(" ").trim();
+      } catch {}
+
+      setLines(prev => [...prev, { source: "mic", text: english }]);
+
+      // Save to server
+      try {
+        await axios.post(`${API}/push`, {
+          session_id: sid,
+          text: `[MIC] ${english}`
+        });
+      } catch {}
+    };
+
+    rec.onerror = (e) => {
+      if (e.error === "not-allowed") {
+        setErrorMsg("Mic permission denied.");
+        stopSession();
+      }
+      // other errors — onend restarts
+    };
+
+    rec.onend = () => {
+      if (isRunningRef.current && sessionIdRef.current === sid) {
+        setTimeout(() => startMicRecognition(sid), 200);
+      }
+    };
+
+    try { rec.start(); recognitionRef.current = rec; }
+    catch { setTimeout(() => startMicRecognition(sid), 500); }
   };
 
   // --------------------------------
-  // SYSTEM AUDIO CAPTURE
+  // SYSTEM AUDIO — MediaRecorder
   // --------------------------------
   const startSystemAudio = (sid, displayStream) => {
     if (!displayStream || displayStream.getAudioTracks().length === 0) return;
@@ -118,27 +134,24 @@ function App() {
       if (systemChunksRef.current.length > 0) {
         const blob = new Blob(systemChunksRef.current, { type: mimeType });
         systemChunksRef.current = [];
-        await sendAudioChunk(blob, sid, "system");
+        await sendAudioChunk(blob, sid);
       }
       if (isRunningRef.current && sessionIdRef.current === sid && displayStream.active) {
         systemChunksRef.current = [];
         recorder.start();
-        setTimeout(() => {
-          if (recorder.state === "recording") recorder.stop();
-        }, 5000);
+        setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, 5000);
       }
     };
 
     recorder.start();
-    setTimeout(() => {
-      if (recorder.state === "recording") recorder.stop();
-    }, 5000);
+    setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, 5000);
   };
 
   // --------------------------------
   // START SESSION
   // --------------------------------
   const startSession = async () => {
+    if (!SpeechRecognition) { setErrorMsg("Use Chrome on desktop."); return; }
     setErrorMsg("");
     setLines([]);
 
@@ -153,10 +166,10 @@ function App() {
       setIsRunning(true);
       setAudioSources(["mic"]);
 
-      // Start microphone capture
-      await startMicrophoneAudio(newSessionId);
+      // Start mic via Web Speech API
+      startMicRecognition(newSessionId);
 
-      // Start system audio capture (screen share)
+      // Try system audio
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -166,7 +179,7 @@ function App() {
         displayStreamRef.current = displayStream;
 
         if (displayStream.getAudioTracks().length > 0) {
-          setAudioSources(prev => [...prev, "system"]);
+          setAudioSources(["mic", "system"]);
           startSystemAudio(newSessionId, displayStream);
           displayStream.getAudioTracks()[0].onended = () => {
             setAudioSources(prev => prev.filter(s => s !== "system"));
@@ -178,9 +191,8 @@ function App() {
           displayStream.getTracks().forEach(t => t.stop());
           setErrorMsg("Tip: tick 'Share tab audio' in screen share dialog.");
         }
-      } catch (err) {
-        console.log("Screen share cancelled or failed");
-      }
+      } catch { /* cancelled — mic still works */ }
+
     } catch (err) {
       console.error(err);
       setErrorMsg("Failed to start. Check server.");
@@ -196,17 +208,16 @@ function App() {
     isRunningRef.current = false;
     sessionIdRef.current = "";
 
-    if (micMediaRecorderRef.current?.state === "recording") {
-      micMediaRecorderRef.current.stop();
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach(t => t.stop());
-      micStreamRef.current = null;
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch {}
+      recognitionRef.current = null;
     }
 
     if (systemMediaRecorderRef.current?.state === "recording") {
-      systemMediaRecorderRef.current.stop();
+      try { systemMediaRecorderRef.current.stop(); } catch {}
+      systemMediaRecorderRef.current = null;
     }
+
     if (displayStreamRef.current) {
       displayStreamRef.current.getTracks().forEach(t => t.stop());
       displayStreamRef.current = null;
@@ -217,7 +228,7 @@ function App() {
   };
 
   // --------------------------------
-  // LOAD SESSIONS
+  // SESSIONS LIST
   // --------------------------------
   useEffect(() => {
     const interval = setInterval(async () => {
@@ -226,19 +237,19 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // --------------------------------
+  // LOAD OLD SESSION
+  // --------------------------------
   const loadSession = async (sid) => {
     if (!sid) return;
     try {
       setSelectedSession(sid);
       const res = await axios.get(`${API}/transcript/${sid}`);
-      const parsed = res.data.text
-        .split("\n")
-        .filter(l => l.trim())
-        .map(l => {
-          if (l.startsWith("[MIC] ")) return { source: "mic", text: l.replace("[MIC] ", "") };
-          if (l.startsWith("[SYSTEM] ")) return { source: "system", text: l.replace("[SYSTEM] ", "") };
-          return { source: "mic", text: l };
-        });
+      const parsed = res.data.text.split("\n").filter(l => l.trim()).map(l => {
+        if (l.startsWith("[MIC] ")) return { source: "mic", text: l.replace("[MIC] ", "") };
+        if (l.startsWith("[SYSTEM] ")) return { source: "system", text: l.replace("[SYSTEM] ", "") };
+        return { source: "system", text: l };
+      });
       setLines(parsed);
     } catch {}
   };
@@ -251,34 +262,29 @@ function App() {
   }, [lines]);
 
   // --------------------------------
-  // DOWNLOAD PDF / WORD
+  // DOWNLOAD
   // --------------------------------
   const downloadPDF = async () => {
-    let summary = "";
-    try {
-      const fullText = lines.map(l => l.text).join(" ");
-      const res = await axios.post(`${API}/summarise`, { text: fullText });
-      summary = res.data.summary;
-    } catch(e) { console.warn("Summary failed", e); }
-    const report = createReportData(lines, selectedSession);
-    report.summary = summary;
-    exportPDF(report);
+    const { default: jsPDF } = await import("jspdf");
+    const doc = new jsPDF();
+    const text = lines.map(l => `[${l.source.toUpperCase()}] ${l.text}`).join("\n");
+    const split = doc.splitTextToSize(text, 170);
+    doc.text(split, 15, 20);
+    doc.save("transcript.pdf");
   };
 
   const downloadWord = async () => {
-    let summary = "";
-    try {
-      const fullText = lines.map(l => l.text).join(" ");
-      const res = await axios.post(`${API}/summarise`, { text: fullText });
-      summary = res.data.summary;
-    } catch(e) { console.warn("Summary failed", e); }
-    const report = createReportData(lines, selectedSession);
-    report.summary = summary;
-    await exportWord(report);
+    const { Document, Packer, Paragraph } = await import("docx");
+    const { saveAs } = await import("file-saver");
+    const doc = new Document({
+      sections: [{ children: lines.map(l => new Paragraph(`[${l.source.toUpperCase()}] ${l.text}`)) }]
+    });
+    const blob = await Packer.toBlob(doc);
+    saveAs(blob, "transcript.docx");
   };
 
   // --------------------------------
-  // RENDER PANELS (tagged and prose)
+  // PANELS
   // --------------------------------
   const renderTagged = (filterFn, ref) => (
     <div className="transcript-scroll" ref={ref}>
@@ -297,21 +303,18 @@ function App() {
   const renderProse = (ref) => {
     if (lines.length === 0) return (
       <div className="transcript-scroll" ref={ref}>
-        <p className="empty-hint">All transcript will appear here as flowing text...</p>
+        <p className="empty-hint">All transcript appears here as flowing text...</p>
       </div>
     );
 
     const groups = [];
-    lines.forEach((l) => {
+    lines.forEach(l => {
       if (l.source === "mic") {
         groups.push({ type: "mic", text: l.text });
       } else {
         const last = groups[groups.length - 1];
-        if (last && last.type === "system") {
-          last.text += " " + l.text;
-        } else {
-          groups.push({ type: "system", text: l.text });
-        }
+        if (last && last.type === "system") last.text += " " + l.text;
+        else groups.push({ type: "system", text: l.text });
       }
     });
 
@@ -360,7 +363,7 @@ function App() {
           {!isRunning && (
             <select value={selectedSession} onChange={(e) => loadSession(e.target.value)} className="dropdown">
               <option value="">Previous Sessions</option>
-              {sessions.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+              {sessions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
             </select>
           )}
         </div>
