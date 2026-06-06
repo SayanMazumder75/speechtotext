@@ -1,4 +1,4 @@
-import { Document, Packer, Paragraph, TextRun, AlignmentType, PageBorder, PageBorderZOrder, PageBorderDisplay, BorderStyle } from "docx";
+import { Document, Packer, Paragraph, TextRun, AlignmentType, BorderStyle, WidthType, Table, TableRow, TableCell, ShadingType } from "docx";
 import { saveAs } from "file-saver";
 
 export const exportWord = async (report) => {
@@ -87,39 +87,45 @@ export const exportWord = async (report) => {
   children.push(new Paragraph({ text: `Microphone Words: ${report.micWords}` }));
   children.push(new Paragraph({ text: `System Words: ${report.systemWords}` }));
 
-  // ----- Document with Page Border -----
+  // ----- Wrap everything in a bordered table (simulates page border) -----
+  const borderStyle = {
+    style: BorderStyle.SINGLE,
+    size: 1,
+    color: "000000",
+  };
+
+  const table = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    margins: { top: 200, bottom: 200, left: 200, right: 200 },
+    borders: {
+      top: borderStyle,
+      bottom: borderStyle,
+      left: borderStyle,
+      right: borderStyle,
+      insideHorizontal: borderStyle, // optional, but gives cell separation
+      insideVertical: borderStyle,
+    },
+    rows: [
+      new TableRow({
+        children: [
+          new TableCell({
+            children: children,
+            borders: {
+              top: borderStyle,
+              bottom: borderStyle,
+              left: borderStyle,
+              right: borderStyle,
+            },
+          }),
+        ],
+      }),
+    ],
+  });
+
   const doc = new Document({
     sections: [
       {
-        properties: {
-          page: {
-            pageBorders: {
-              pageBorderTop: {
-                style: BorderStyle.SINGLE,
-                size: 1,          // 1 point
-                color: "000000",
-              },
-              pageBorderBottom: {
-                style: BorderStyle.SINGLE,
-                size: 1,
-                color: "000000",
-              },
-              pageBorderLeft: {
-                style: BorderStyle.SINGLE,
-                size: 1,
-                color: "000000",
-              },
-              pageBorderRight: {
-                style: BorderStyle.SINGLE,
-                size: 1,
-                color: "000000",
-              },
-              pageBorderZOrder: PageBorderZOrder.FRONT,
-              pageBorderDisplay: PageBorderDisplay.ALL_PAGES,
-            },
-          },
-        },
-        children: children,
+        children: [table],
       },
     ],
   });
