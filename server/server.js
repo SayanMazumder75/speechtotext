@@ -12,9 +12,6 @@ app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// --------------------------------
-// MONGODB
-// --------------------------------
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
   .catch(err => console.error("MongoDB error:", err));
@@ -25,31 +22,28 @@ const sessionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 const Session = mongoose.model("Session", sessionSchema);
-mongoose.connection.on('connected', () => console.log('MongoDB connected'));
-mongoose.connection.on('error', (err) => console.error('MongoDB connection error:', err));
+
 // --------------------------------
-// LOAD BALANCING FOR GROQ API KEYS
+// GROQ KEY ROTATION
 // --------------------------------
 const groqApiKeys = [
   process.env.GROQ_API_KEY_1,
   process.env.GROQ_API_KEY_2,
   process.env.GROQ_API_KEY_3,
-  process.env.GROQ_API_KEY_4
-].filter(key => key && key.trim() !== "");
+  process.env.GROQ_API_KEY_4,
+  process.env.GROQ_API_KEY
+].filter(k => k && k.trim());
 
 let currentKeyIndex = 0;
-
 function getNextGroqKey() {
-  if (groqApiKeys.length === 0) {
-    throw new Error("No Groq API keys configured");
-  }
+  if (!groqApiKeys.length) throw new Error("No Groq API keys configured");
   const key = groqApiKeys[currentKeyIndex];
   currentKeyIndex = (currentKeyIndex + 1) % groqApiKeys.length;
   return key;
 }
 
 // --------------------------------
-// GOOGLE TRANSLATE (free)
+// TRANSLATE
 // --------------------------------
 async function translateToEnglish(text) {
   if (!text) return "";
@@ -58,17 +52,14 @@ async function translateToEnglish(text) {
     const res = await fetch(url);
     const data = await res.json();
     return data[0].map(c => c[0]).join(" ").trim();
-  } catch (err) {
-    console.error("Translation error:", err);
-    return text; // fallback to original
-  }
+  } catch { return text; }
 }
 
 // --------------------------------
-// CALL GROQ WHISPER (no task param)
+// WHISPER
 // --------------------------------
-async function callGroqWhisper(audioBuffer, mimeType, maxRetries = groqApiKeys.length) {
-  let lastError = null;
+async function callGroqWhisper(audioBuffer, mimeType) {
+  const maxRetries = groqApiKeys.length;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const apiKey = getNextGroqKey();
     try {
@@ -79,160 +70,147 @@ async function callGroqWhisper(audioBuffer, mimeType, maxRetries = groqApiKeys.l
       });
       formData.append("model", "whisper-large-v3");
       formData.append("response_format", "json");
-      // NO task=translate – Groq doesn't support it
 
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          ...formData.getHeaders(),
-        },
+        headers: { Authorization: `Bearer ${apiKey}`, ...formData.getHeaders() },
         body: formData,
       });
 
-      if (response.status === 429) {
-        console.warn(`Rate limit hit for key ${apiKey.slice(0,5)}..., trying next`);
-        continue;
-      }
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`Groq API error (${response.status}): ${errorText}`);
-        throw new Error(`Groq API returned ${response.status}: ${errorText}`);
-      }
+      if (response.status === 429) { console.warn("Rate limit, trying next key"); continue; }
+      if (!response.ok) throw new Error(`Groq ${response.status}`);
 
       const data = await response.json();
-      let transcript = data.text?.trim() || "";
-      return transcript;
+      return data.text?.trim() || "";
     } catch (err) {
-      console.error(`Attempt ${attempt+1} failed with key ${apiKey?.slice(0,5)}:`, err.message);
-      lastError = err;
+      console.error(`Whisper attempt ${attempt+1} failed:`, err.message);
     }
   }
-  throw new Error(`All Groq keys failed: ${lastError?.message}`);
+  return "";
 }
 
 // --------------------------------
-// IN‑MEMORY CACHE TO PREVENT DUPLICATE LINES
+// HALLUCINATION FILTER
 // --------------------------------
-const recentTranscripts = new Map(); // key: `${session_id}:${source}` -> last transcript
+const HALLUCINATIONS = [
+  "thank you", "thanks", "bye", "goodbye",
+  "you", "no", "yes", "okay", "ok",
+  "hmm", "um", "uh", "ah", "oh",
+  ".", "...", " ", "hello",
+  "subscribe", "like", "share", "please", "welcome",
+  "hello everyone", "i'm going to make a",
+  "i'm going to make", "i'm going to",
+  "hello everyone, i'm going to make",
+  "going to make", "looking at the camera",
+  "subtitles by", "translated by", "transcribed by",
+  "[music]", "[applause]", "[laughter]", "[ music ]",
+  "foreign", "[foreign]",
+];
+
+function isHallucination(text) {
+  const lower = text.toLowerCase().trim();
+
+  // Exact match
+  if (HALLUCINATIONS.some(h => lower === h.toLowerCase())) return true;
+
+  // Partial match on short text (≤6 words)
+  const wordCount = text.split(" ").length;
+  if (wordCount <= 6 && HALLUCINATIONS.some(h => lower.includes(h.toLowerCase()))) return true;
+
+  // Too short
+  if (wordCount <= 2 && text.length < 12) return true;
+
+  // Repetitive words — "you you you", "the the the"
+  const words = lower.split(" ");
+  const unique = new Set(words);
+  if (words.length >= 3 && unique.size <= 2) return true;
+
+  return false;
+}
 
 // --------------------------------
-// TRANSCRIBE ENDPOINT
+// DUPLICATE CACHE
+// --------------------------------
+const recentTranscripts = new Map();
+
+// --------------------------------
+// TRANSCRIBE
 // --------------------------------
 app.post("/transcribe", upload.single("audio"), async (req, res) => {
   const { session_id, source } = req.body;
-  console.log(`[${session_id}] Transcribe request from ${source}`);
-
   if (!session_id) return res.status(400).json({ error: "session_id required" });
-  if (!req.file) return res.status(400).json({ error: "audio file required" });
+  if (!req.file) return res.status(400).json({ error: "audio required" });
 
   try {
-    // Step 1: Whisper transcription (original language)
-    let originalText = await callGroqWhisper(req.file.buffer, req.file.mimetype);
-    if (!originalText) {
+    let original = await callGroqWhisper(req.file.buffer, req.file.mimetype);
+    if (!original) return res.json({ text: "" });
+
+    console.log(`[${session_id}][${source}] raw: ${original}`);
+
+    if (isHallucination(original)) {
+      console.log(`[${session_id}] filtered: ${original}`);
       return res.json({ text: "" });
     }
 
-    console.log(`[${session_id}] Whisper raw (${source}): ${originalText}`);
-
-    // Step 2: Filter out obvious hallucinations / silence
-    const HALLUCINATIONS = [
-      "thank you", "thanks", "bye", "goodbye", "you", "no", "yes",
-      "okay", "ok", "hmm", "um", "uh", "ah", "oh", ".", "...", " ",
-      "subscribe", "like", "share", "please", "welcome", "hello",
-      "hello everyone", "i'm going to make a", "i'm going to make",  // added common repeats
-    ];
-    const lower = originalText.toLowerCase();
-    if (HALLUCINATIONS.some(h => lower === h || lower.includes(h) && originalText.split(" ").length <= 5)) {
-      console.log(`[${session_id}] Filtered hallucination: ${originalText}`);
-      return res.json({ text: "" });
-    }
-    if (originalText.split(" ").length <= 2 && originalText.length < 10) {
-      console.log(`[${session_id}] Too short, filtered: ${originalText}`);
-      return res.json({ text: "" });
-    }
-
-    // Step 3: Prevent duplicate consecutive lines (same text from same source within 10 seconds)
+    // Duplicate check
     const cacheKey = `${session_id}:${source}`;
-    const lastText = recentTranscripts.get(cacheKey);
-    if (lastText === originalText) {
-      console.log(`[${session_id}] Duplicate line ignored: ${originalText}`);
+    if (recentTranscripts.get(cacheKey) === original) {
+      console.log(`[${session_id}] duplicate ignored`);
       return res.json({ text: "" });
     }
-    // After setting the cache, schedule deletion after 10 seconds
-recentTranscripts.set(cacheKey, originalText);
-setTimeout(() => {
-  if (recentTranscripts.get(cacheKey) === originalText) {
-    recentTranscripts.delete(cacheKey);
-  }
-}, 10000);
-    // Optional: auto‑clear after 10 seconds (but not critical)
+    recentTranscripts.set(cacheKey, original);
+    setTimeout(() => {
+      if (recentTranscripts.get(cacheKey) === original) recentTranscripts.delete(cacheKey);
+    }, 10000);
 
-    // Step 4: Translate to English
-    const englishText = await translateToEnglish(originalText);
-    console.log(`[${session_id}] Translated (${source}): ${englishText}`);
+    const english = await translateToEnglish(original);
+    console.log(`[${session_id}][${source}] translated: ${english}`);
 
-    // Step 5: Save to database with proper tag
-    const tagged = `[${source?.toUpperCase() || "SYSTEM"}] ${englishText}`;
+    // Save to DB
+    const tagged = `[${(source || "system").toUpperCase()}] ${english}`;
     const session = await Session.findOne({ session_id });
     if (session) {
-      await Session.findOneAndUpdate(
-        { session_id },
-        { text: session.text + tagged + "\n" }
-      );
+      await Session.findOneAndUpdate({ session_id }, { text: session.text + tagged + "\n" });
     }
 
-    res.json({ text: englishText });
+    res.json({ text: english });
   } catch (err) {
-    console.error(`Transcribe error (${source}):`, err);
+    console.error("Transcribe error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // --------------------------------
-// SUMMARISE (unchanged, uses Groq Llama)
+// SUMMARISE
 // --------------------------------
 app.post("/summarise", async (req, res) => {
   const { text } = req.body;
   if (!text) return res.json({ summary: "" });
-
   try {
     const apiKey = groqApiKeys[0];
     const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "llama3-8b-8192",
         max_tokens: 200,
-        messages: [{ role: "user", content: `Summarise the following into ONE sentence. Return ONLY the summary.\n\n"${text}"` }]
+        messages: [{ role: "user", content: `Summarise into ONE sentence. Return ONLY the summary.\n\n"${text}"` }]
       })
     });
     const data = await groqRes.json();
-    const summary = data?.choices?.[0]?.message?.content?.trim() || text;
-    res.json({ summary });
-  } catch (err) {
-    console.error("Summarise error:", err);
-    res.json({ summary: text });
-  }
+    res.json({ summary: data?.choices?.[0]?.message?.content?.trim() || text });
+  } catch { res.json({ summary: text }); }
 });
 
 // --------------------------------
-// SESSION ROUTES (unchanged)
+// SESSION ROUTES
 // --------------------------------
 app.post("/start-session", async (req, res) => {
   const session_id = req.body?.session_id || Date.now().toString();
   try {
-    console.log("Creating session with ID:", session_id);
     await Session.create({ session_id });
-    console.log("Session created successfully");
     res.json({ success: true, session_id });
   } catch (err) {
-    console.error("ERROR in /start-session:", err.message);
-    console.error(err.stack);
     res.status(500).json({ error: err.message });
   }
 });
