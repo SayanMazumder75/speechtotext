@@ -74,7 +74,6 @@ app.post("/push", async (req, res) => {
 
 // --------------------------------
 // WHISPER TRANSCRIBE + TRANSLATE
-// Receives audio blob from browser
 // --------------------------------
 app.post("/transcribe", upload.single("audio"), async (req, res) => {
   const { session_id } = req.body;
@@ -90,8 +89,6 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     });
     formData.append("model", "whisper-large-v3");
     formData.append("response_format", "json");
-    // Groq Whisper auto-detects language and transcribes
-    // No "task" param supported — translation handled by server below
 
     const whisperRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
       method: "POST",
@@ -112,7 +109,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     let transcript = whisperData.text?.trim();
     console.log(`[${session_id}] Whisper raw: ${transcript}`);
 
-    // Filter Whisper hallucinations — common fake outputs on silence
+    // Filter Whisper hallucinations
     const HALLUCINATIONS = [
       "thank you", "thanks", "bye", "goodbye", "you", "no", "yes",
       "okay", "ok", "hmm", "um", "uh", "ah", "oh", ".", "...", " ",
@@ -124,13 +121,12 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       console.log(`[${session_id}] Hallucination filtered: ${transcript}`);
       return res.json({ text: "" });
     }
-    // Also filter very short outputs (1-2 words likely hallucination)
     if (transcript && transcript.split(" ").length <= 1 && transcript.length < 8) {
       console.log(`[${session_id}] Too short, filtered: ${transcript}`);
       return res.json({ text: "" });
     }
 
-    // Translate to English using Google free API
+    // Translate to English
     if (transcript) {
       try {
         const translateRes = await fetch(
@@ -163,38 +159,38 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
 });
 
 // --------------------------------
-// SUMMARISE via Claude (called from frontend)
-// Avoids CORS — browser can't call Anthropic directly
+// SUMMARISE via Groq (only one version kept)
 // --------------------------------
 app.post("/summarise", async (req, res) => {
-  const { sentences } = req.body;
-  if (!sentences || !sentences.length) return res.json({ summary: "" });
+  const { text } = req.body;
+  if (!text) return res.json({ summary: "" });
 
   try {
-    const joined = sentences.join(" ");
-    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01"
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "llama3-8b-8192",
         max_tokens: 200,
-        messages: [{
-          role: "user",
-          content: `Summarise the following transcribed audio into ONE concise sentence. Return ONLY the sentence, nothing else.
+        messages: [
+          {
+            role: "user",
+            content: `Summarise the following transcribed audio into ONE concise sentence. Return ONLY the summary, nothing else.
 
-"${joined}"`
-        }]
+"${text}"`
+          }
+        ]
       })
     });
-    const data = await anthropicRes.json();
-    const summary = data?.content?.[0]?.text?.trim() || joined;
+    const data = await groqRes.json();
+    const summary = data?.choices?.[0]?.message?.content?.trim() || text;
     res.json({ summary });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Summarise error:", err);
+    res.json({ summary: text });
   }
 });
 
@@ -225,41 +221,6 @@ app.get("/transcript/:session_id", async (req, res) => {
     res.json({ text: session.text });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-// --------------------------------
-// SUMMARISE via Groq (replaces Claude direct call)
-// --------------------------------
-app.post("/summarise", async (req, res) => {
-  const { text } = req.body;
-  if (!text) return res.json({ summary: text });
-
-  try {
-    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "llama3-8b-8192",
-        max_tokens: 200,
-        messages: [
-          {
-            role: "user",
-            content: `Summarise the following transcribed audio into ONE concise sentence. Return ONLY the summary, nothing else.
-
-"${text}"`
-          }
-        ]
-      })
-    });
-    const data = await groqRes.json();
-    const summary = data?.choices?.[0]?.message?.content?.trim() || text;
-    res.json({ summary });
-  } catch (err) {
-    res.json({ summary: text });
   }
 });
 

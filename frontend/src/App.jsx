@@ -263,34 +263,35 @@ function App() {
   }, [lines]);
 
   // --------------------------------
-  // DOWNLOAD helpers
+  // DOWNLOAD helpers (updated to include summary)
   // --------------------------------
   const fullText = lines.map(l => `[${l.source.toUpperCase()}] ${l.text}`).join("\n");
 
-  const downloadPDF = () => {
+  const downloadPDF = async () => {
+    let summary = "";
+    try {
+      const fullTextForSummary = lines.map(l => l.text).join(" ");
+      const res = await axios.post(`${API}/summarise`, { text: fullTextForSummary });
+      summary = res.data.summary;
+    } catch(e) { console.warn("Summary failed", e); }
 
-  const report =
-    createReportData(
-      lines,
-      selectedSession
-    );
+    const report = createReportData(lines, selectedSession);
+    report.summary = summary;
+    exportPDF(report);
+  };
 
-  exportPDF(report);
-};
+  const downloadWord = async () => {
+    let summary = "";
+    try {
+      const fullTextForSummary = lines.map(l => l.text).join(" ");
+      const res = await axios.post(`${API}/summarise`, { text: fullTextForSummary });
+      summary = res.data.summary;
+    } catch(e) { console.warn("Summary failed", e); }
 
-  const downloadWord =
-  async () => {
-
-    const report =
-      createReportData(
-        lines,
-        selectedSession
-      );
-
-    await exportWord(
-      report
-    );
-};
+    const report = createReportData(lines, selectedSession);
+    report.summary = summary;
+    await exportWord(report);
+  };
 
   // --------------------------------
   // PANEL RENDERER — tagged (mic/system)
