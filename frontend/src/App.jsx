@@ -4,8 +4,6 @@ import { Moon, Sun, Play, Square, Download, Mic, Monitor } from "lucide-react";
 import "./index.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
 function App() {
   const [lines, setLines] = useState([]);
   const [darkMode, setDarkMode] = useState(true);
@@ -21,9 +19,6 @@ function App() {
   const sysRef = useRef(null);
   const sessionIdRef = useRef("");
   const isRunningRef = useRef(false);
-
-  // Mic — Web Speech API
-  const recognitionRef = useRef(null);
 
   // System — MediaRecorder
   const systemMediaRecorderRef = useRef(null);
@@ -52,64 +47,72 @@ function App() {
   };
 
   // --------------------------------
-  // MIC — Web Speech API (instant response)
+  // MIC — MediaRecorder → Whisper
+  // Auto-detects any language
   // --------------------------------
-  const startMicRecognition = (sid) => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome — Web Speech API not supported.");
-      return;
+  const micMediaRecorderRef = useRef(null);
+  const micChunksRef = useRef([]);
+  const micStreamRef = useRef(null);
+
+  const startMicRecording = async (sid) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = stream;
+
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus" : "audio/webm";
+
+      const recorder = new MediaRecorder(stream, { mimeType });
+      micMediaRecorderRef.current = recorder;
+      micChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data?.size > 0) micChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        if (micChunksRef.current.length > 0) {
+          const blob = new Blob(micChunksRef.current, { type: mimeType });
+          micChunksRef.current = [];
+
+          // Send to Whisper via /transcribe with source=mic
+          if (blob.size > 1000 && isRunningRef.current) {
+            try {
+              const formData = new FormData();
+              formData.append("audio", blob, "audio.webm");
+              formData.append("session_id", sid);
+              formData.append("source", "mic");
+              const res = await axios.post(`${API}/transcribe`, formData, {
+                headers: { "Content-Type": "multipart/form-data" }
+              });
+              if (res.data.text) {
+                setLines(prev => [...prev, { source: "mic", text: res.data.text }]);
+              }
+            } catch (err) {
+              console.error("Mic transcribe error:", err);
+            }
+          }
+        }
+
+        // Restart if still running
+        if (isRunningRef.current && sessionIdRef.current === sid) {
+          micChunksRef.current = [];
+          recorder.start();
+          setTimeout(() => {
+            if (recorder.state === "recording") recorder.stop();
+          }, 4000);
+        }
+      };
+
+      recorder.start();
+      setTimeout(() => {
+        if (recorder.state === "recording") recorder.stop();
+      }, 4000);
+
+    } catch (err) {
+      console.error("Mic error:", err);
+      setErrorMsg("Could not access microphone. Allow mic permissions.");
     }
-
-    const rec = new SpeechRecognition();
-    rec.continuous = false;
-    rec.interimResults = false;
-    rec.lang = "hi-IN";
-
-    rec.onresult = async (e) => {
-      const transcript = Array.from(e.results)
-        .filter(r => r.isFinal)
-        .map(r => r[0].transcript)
-        .join(" ").trim();
-
-      if (!transcript) return;
-      console.log("[mic]", transcript);
-
-      // Translate
-      let english = transcript;
-      try {
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(transcript)}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        english = data[0].map(c => c[0]).join(" ").trim();
-      } catch {}
-
-      setLines(prev => [...prev, { source: "mic", text: english }]);
-
-      // Save to server
-      try {
-        await axios.post(`${API}/push`, {
-          session_id: sid,
-          text: `[MIC] ${english}`
-        });
-      } catch {}
-    };
-
-    rec.onerror = (e) => {
-      if (e.error === "not-allowed") {
-        setErrorMsg("Mic permission denied.");
-        stopSession();
-      }
-      // other errors — onend restarts
-    };
-
-    rec.onend = () => {
-      if (isRunningRef.current && sessionIdRef.current === sid) {
-        setTimeout(() => startMicRecognition(sid), 200);
-      }
-    };
-
-    try { rec.start(); recognitionRef.current = rec; }
-    catch { setTimeout(() => startMicRecognition(sid), 500); }
   };
 
   // --------------------------------
@@ -166,8 +169,8 @@ function App() {
       setIsRunning(true);
       setAudioSources(["mic"]);
 
-      // Start mic via Web Speech API
-      startMicRecognition(newSessionId);
+      // Start mic via MediaRecorder → Whisper
+      startMicRecording(newSessionId);
 
       // Try system audio
       try {
@@ -208,9 +211,13 @@ function App() {
     isRunningRef.current = false;
     sessionIdRef.current = "";
 
-    if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch {}
-      recognitionRef.current = null;
+    if (micMediaRecorderRef.current?.state === "recording") {
+      try { micMediaRecorderRef.current.stop(); } catch {}
+      micMediaRecorderRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
     }
 
     if (systemMediaRecorderRef.current?.state === "recording") {
