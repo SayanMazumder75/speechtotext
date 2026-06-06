@@ -59,7 +59,8 @@ async function callGroqWhisper(audioBuffer, mimeType, maxRetries = groqApiKeys.l
       });
       formData.append("model", "whisper-large-v3");
       formData.append("response_format", "json");
-      formData.append("task", "translate");   // translate any language to English
+      // ❌ DO NOT APPEND "task" – Groq does NOT support it
+      // formData.append("task", "translate");
 
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
@@ -72,23 +73,25 @@ async function callGroqWhisper(audioBuffer, mimeType, maxRetries = groqApiKeys.l
 
       if (response.status === 429) {
         console.warn(`Rate limit hit for key ${apiKey.slice(0,5)}..., trying next`);
-        continue; // try next key
+        continue;
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`Groq API error (${response.status}): ${errorText}`);
+        throw new Error(`Groq API returned ${response.status}: ${errorText}`);
       }
 
       const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error.message);
-      }
       let transcript = data.text?.trim() || "";
-      // Filter common hallucinations
+
+      // Hallucination filter (unchanged)
       const HALLUCINATIONS = [
         "thank you", "thanks", "bye", "goodbye", "you", "no", "yes",
         "okay", "ok", "hmm", "um", "uh", "ah", "oh", ".", "...", " ",
         "subscribe", "like", "share", "please", "welcome", "hello"
       ];
-      if (transcript && HALLUCINATIONS.some(h =>
-        transcript.toLowerCase().trim() === h.toLowerCase()
-      )) {
+      if (transcript && HALLUCINATIONS.some(h => transcript.toLowerCase().trim() === h.toLowerCase())) {
         return "";
       }
       if (transcript && transcript.split(" ").length <= 1 && transcript.length < 8) {
