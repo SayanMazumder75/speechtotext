@@ -112,6 +112,24 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     let transcript = whisperData.text?.trim();
     console.log(`[${session_id}] Whisper raw: ${transcript}`);
 
+    // Filter Whisper hallucinations — common fake outputs on silence
+    const HALLUCINATIONS = [
+      "thank you", "thanks", "bye", "goodbye", "you", "no", "yes",
+      "okay", "ok", "hmm", "um", "uh", "ah", "oh", ".", "...", " ",
+      "subscribe", "like", "share", "please", "welcome", "hello"
+    ];
+    if (transcript && HALLUCINATIONS.some(h =>
+      transcript.toLowerCase().trim() === h.toLowerCase()
+    )) {
+      console.log(`[${session_id}] Hallucination filtered: ${transcript}`);
+      return res.json({ text: "" });
+    }
+    // Also filter very short outputs (1-2 words likely hallucination)
+    if (transcript && transcript.split(" ").length <= 1 && transcript.length < 8) {
+      console.log(`[${session_id}] Too short, filtered: ${transcript}`);
+      return res.json({ text: "" });
+    }
+
     // Translate to English using Google free API
     if (transcript) {
       try {
@@ -145,6 +163,42 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
 });
 
 // --------------------------------
+// SUMMARISE via Claude (called from frontend)
+// Avoids CORS — browser can't call Anthropic directly
+// --------------------------------
+app.post("/summarise", async (req, res) => {
+  const { sentences } = req.body;
+  if (!sentences || !sentences.length) return res.json({ summary: "" });
+
+  try {
+    const joined = sentences.join(" ");
+    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 200,
+        messages: [{
+          role: "user",
+          content: `Summarise the following transcribed audio into ONE concise sentence. Return ONLY the sentence, nothing else.
+
+"${joined}"`
+        }]
+      })
+    });
+    const data = await anthropicRes.json();
+    const summary = data?.content?.[0]?.text?.trim() || joined;
+    res.json({ summary });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --------------------------------
 // GET ALL SESSIONS
 // --------------------------------
 app.get("/transcripts", async (req, res) => {
@@ -171,6 +225,41 @@ app.get("/transcript/:session_id", async (req, res) => {
     res.json({ text: session.text });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --------------------------------
+// SUMMARISE via Groq (replaces Claude direct call)
+// --------------------------------
+app.post("/summarise", async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.json({ summary: text });
+
+  try {
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "llama3-8b-8192",
+        max_tokens: 200,
+        messages: [
+          {
+            role: "user",
+            content: `Summarise the following transcribed audio into ONE concise sentence. Return ONLY the summary, nothing else.
+
+"${text}"`
+          }
+        ]
+      })
+    });
+    const data = await groqRes.json();
+    const summary = data?.choices?.[0]?.message?.content?.trim() || text;
+    res.json({ summary });
+  } catch (err) {
+    res.json({ summary: text });
   }
 });
 
