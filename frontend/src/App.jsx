@@ -12,6 +12,7 @@ import {
 import { createReportData } from "./utils/transcriptFormatter";
 import { exportPDF } from "./utils/exportPdf";
 import { exportWord } from "./utils/exportWord";
+import InsightsPanel from "./InsightsPanel";
 import "./index.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
@@ -32,6 +33,7 @@ function App() {
   const [inputLang, setInputLang] = useState("bn-IN");
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
+  const [insights, setInsights] = useState(null);
 
   const combinedRef = useRef(null);
   const micRef = useRef(null);
@@ -191,14 +193,7 @@ function App() {
 
       if (!transcript) return;
 
-      console.log("[mic original]", transcript);
-
-      const english = await translateToEnglish(
-        transcript,
-        inputLangRef.current
-      );
-
-      console.log("[mic english]", english);
+      const english = await translateToEnglish(transcript, inputLangRef.current);
 
       const timestamp = formatTime(new Date());
 
@@ -401,7 +396,17 @@ function App() {
   const downloadPDF = async () => {
     const sessionName = selectedSession || sessionId || "Current Session";
     const report = createReportData(lines, sessionName);
-    report.summary = "";
+    if (insights) {
+      report.summary    = insights.summary    || "";
+      report.keyPoints  = insights.keyPoints  || [];
+      report.flashcards = insights.flashcards || [];
+      report.quiz       = insights.quiz       || [];
+    } else {
+      report.summary    = "";
+      report.keyPoints  = [];
+      report.flashcards = [];
+      report.quiz       = [];
+    }
     exportPDF(report);
   };
 
@@ -422,8 +427,18 @@ function App() {
   const downloadWord = async () => {
     const sessionName = selectedSession || sessionId || "Current Session";
     const report = createReportData(lines, sessionName);
-    report.summary = "";
-    await exportWord(report);
+    if (insights) {
+      report.summary    = insights.summary    || "";
+      report.keyPoints  = insights.keyPoints  || [];
+      report.flashcards = insights.flashcards || [];
+      report.quiz       = insights.quiz       || [];
+    } else {
+      report.summary    = "";
+      report.keyPoints  = [];
+      report.flashcards = [];
+      report.quiz       = [];
+    }
+    exportWord(report);
   };
 
   const renderTagged = (filterFn, ref, emptyMessage) => (
@@ -676,6 +691,14 @@ function App() {
           )}
         </div>
       </div>
+
+      {/* ── AI INTELLIGENCE PIPELINE ── */}
+      <InsightsPanel
+        lines={lines}
+        darkMode={darkMode}
+        insights={insights}
+        setInsights={setInsights}
+      />
     </div>
   );
 }
