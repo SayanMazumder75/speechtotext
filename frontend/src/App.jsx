@@ -7,7 +7,8 @@ import {
   Square,
   Download,
   Mic,
-  Monitor
+  Monitor,
+  Sparkles
 } from "lucide-react";
 import { createReportData } from "./utils/transcriptFormatter";
 import { exportPDF } from "./utils/exportPdf";
@@ -34,6 +35,12 @@ function App() {
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [insights, setInsights] = useState(null);
+
+  // Audio recording state
+  const [audioRecorder, setAudioRecorder] = useState(null);
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
+  const [audioUrl, setAudioUrl] = useState("");
+  const [audioDuration, setAudioDuration] = useState(0);
 
   const combinedRef = useRef(null);
   const micRef = useRef(null);
@@ -270,6 +277,147 @@ function App() {
     }, 5000);
   };
 
+  // --- Corrected: starts recording after system stream is known ---
+  const startMicrophoneRecording = async (sid, systemStreamParam) => {
+    try {
+      // Use passed stream or fallback to ref (which may be null)
+      const systemStream = systemStreamParam || displayStreamRef.current;
+
+      if (!systemStream || systemStream.getAudioTracks().length === 0) {
+        console.warn("No system audio stream available – recording mic only");
+      }
+
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // Fallback: mic only if no system audio
+      if (!systemStream || systemStream.getAudioTracks().length === 0) {
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+        const recorder = new MediaRecorder(micStream, { mimeType });
+        const chunks = [];
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = async () => {
+          const blob = new Blob(chunks, { type: mimeType });
+          await uploadAudioRecording(sid, blob);
+          micStream.getTracks().forEach(t => t.stop());
+        };
+        recorder.start(1000);
+        setAudioRecorder(recorder);
+        setIsRecordingAudio(true);
+        return;
+      }
+
+      // Mix both streams
+      const audioContext = new AudioContext();
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      const systemSource = audioContext.createMediaStreamSource(systemStream);
+
+      const destination = audioContext.createMediaStreamDestination();
+      micSource.connect(destination);
+      systemSource.connect(destination);
+
+      const mixedStream = destination.stream;
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+      const recorder = new MediaRecorder(mixedStream, { mimeType });
+      const chunks = [];
+
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: mimeType });
+        await uploadAudioRecording(sid, blob);
+        micStream.getTracks().forEach(t => t.stop());
+        audioContext.close();
+      };
+      recorder.start(1000);
+      setAudioRecorder(recorder);
+      setIsRecordingAudio(true);
+    } catch (err) {
+      console.error("Mixed recording error:", err);
+      setErrorMsg("Could not access microphone for recording.");
+    }
+  };
+
+  const uploadAudioRecording = async (sessionId, blob) => {
+    const formData = new FormData();
+    formData.append("audio", blob, "recording.webm");
+    formData.append("session_id", sessionId);
+    try {
+      const res = await axios.post(`${API}/upload-audio`, formData, {
+        headers: { "Content-Type": "multipart/form-data" }
+      });
+      setAudioUrl(res.data.audioUrl);
+      setAudioDuration(res.data.audioDuration);
+    } catch (err) {
+      console.error("Upload failed:", err);
+      setErrorMsg("Failed to save recording.");
+    }
+  };
+
+  const downloadAudio = async () => {
+    if (!audioUrl) return;
+    try {
+      const response = await fetch(audioUrl);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `recording_${selectedSession || sessionId}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Download failed:", err);
+      setErrorMsg("Failed to download recording.");
+    }
+  };
+
+  const regenerateInsightsFromTranscript = async () => {
+    if (!selectedSession) {
+      setErrorMsg("No session selected.");
+      return;
+    }
+    try {
+      const transcriptRes = await axios.get(`${API}/transcript/${selectedSession}`);
+      const transcriptText = transcriptRes.data.text;
+      if (!transcriptText.trim()) {
+        setErrorMsg("Transcript is empty.");
+        return;
+      }
+
+      const prompt = `You are an AI Meeting Intelligence engine. Analyze this meeting transcript and return ONLY valid JSON (no markdown, no preamble).
+
+TRANSCRIPT:
+${transcriptText.slice(0, 6000)}
+
+Return this exact JSON shape:
+{
+  "summary": "2-3 sentence meeting summary",
+  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
+  "actionItems": [
+    { "task": "task description", "owner": "inferred owner or Team", "priority": "High|Medium|Low" }
+  ],
+  "flashcards": [
+    { "front": "term or concept", "back": "definition or explanation" }
+  ],
+  "quiz": [
+    {
+      "question": "question text",
+      "options": ["A", "B", "C", "D"],
+      "answer": "correct option text"
+    }
+  ]
+}
+
+Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensure quiz options array has exactly 4 items and answer matches one option exactly.`;
+
+      const res = await axios.post(`${API}/ai-insights`, { prompt });
+      setInsights(res.data);
+    } catch (err) {
+      setErrorMsg("Failed to regenerate insights.");
+      console.error(err);
+    }
+  };
+
   const startSession = async () => {
     if (!SpeechRecognition) {
       setErrorMsg("Use Chrome on desktop.");
@@ -280,6 +428,9 @@ function App() {
     setSystemAudioTip("");
     setCopyStatus("");
     setLines([]);
+    setAudioUrl("");
+    setAudioDuration(0);
+    setIsRecordingAudio(false);
 
     try {
       const res = await axios.post(`${API}/start-session`, {
@@ -297,6 +448,7 @@ function App() {
 
       startMicRecognition(newSessionId);
 
+      // Try to get system audio first, then start recording
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -318,11 +470,18 @@ function App() {
             }
             displayStreamRef.current = null;
           };
+          // ✅ Start recording AFTER system audio is confirmed
+          startMicrophoneRecording(newSessionId, displayStream);
         } else {
           displayStream.getTracks().forEach((t) => t.stop());
           setSystemAudioTip("Tip: tick 'Share tab audio' in the screen share dialog.");
+          // Start recording with mic only
+          startMicrophoneRecording(newSessionId, null);
         }
-      } catch {
+      } catch (err) {
+        // User denied screen share or error – record mic only
+        console.warn("No screen share, recording mic only");
+        startMicrophoneRecording(newSessionId, null);
       }
     } catch (err) {
       console.error(err);
@@ -356,6 +515,11 @@ function App() {
       displayStreamRef.current = null;
     }
 
+    if (audioRecorder && audioRecorder.state === "recording") {
+      audioRecorder.stop();
+      setIsRecordingAudio(false);
+    }
+
     setIsRunning(false);
     setAudioSources([]);
     setSystemAudioTip("");
@@ -384,6 +548,9 @@ function App() {
         .map(parseTranscriptLine);
 
       setLines(parsed);
+      const audioRes = await axios.get(`${API}/audio/${sid}`);
+      setAudioUrl(audioRes.data.audioUrl || "");
+      setAudioDuration(audioRes.data.audioDuration || 0);
     } catch {}
   };
 
@@ -657,6 +824,33 @@ function App() {
         </span>
       </div>
 
+      {/* Meeting Recording Card */}
+      {(audioUrl || isRecordingAudio) && (
+        <div className="recording-card">
+          <div className="recording-header">
+            <Mic size={16} /> Meeting Recording
+          </div>
+          <div className="recording-content">
+            {isRecordingAudio ? (
+              <div className="recording-indicator">🔴 Recording in progress...</div>
+            ) : (
+              <>
+                <audio controls src={audioUrl} className="audio-player" />
+                <div className="recording-actions">
+                  <button onClick={downloadAudio} className="recording-btn">
+                    <Download size={14} /> Download
+                  </button>
+                  <button onClick={regenerateInsightsFromTranscript} className="recording-btn">
+                    <Sparkles size={14} /> Regenerate AI Insights
+                  </button>
+                </div>
+                <div className="recording-duration">Duration: {formatDuration(audioDuration)}</div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="panels">
         <div className="panel">
           <div className="panel-header combined-header">📋 All</div>
@@ -692,7 +886,6 @@ function App() {
         </div>
       </div>
 
-      {/* ── AI INTELLIGENCE PIPELINE ── */}
       <InsightsPanel
         lines={lines}
         darkMode={darkMode}

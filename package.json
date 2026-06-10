@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "cloudinary": "^2.10.0",
     "docx": "^9.7.1"
   }
 }

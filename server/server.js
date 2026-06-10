@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 const FormData = require("form-data");
 const fetch = require("node-fetch");
+const cloudinary = require("cloudinary").v2;
 
 const app = express();
 app.use(cors());
@@ -12,6 +13,13 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Cloudinary configuration
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
@@ -22,6 +30,8 @@ mongoose.connect(process.env.MONGO_URI)
 const sessionSchema = new mongoose.Schema({
   session_id: { type: String, required: true, unique: true },
   text: { type: String, default: "" },
+  audioUrl: { type: String, default: "" },
+  audioDuration: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
 const Session = mongoose.model("Session", sessionSchema);
@@ -506,6 +516,73 @@ app.get("/transcript/:session_id", async (req, res) => {
     const session = await Session.findOne({ session_id: req.params.session_id });
     if (!session) return res.status(404).json({ error: "Not found" });
     res.json({ text: session.text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Phase 2: Audio Recording Routes ──────────────────────────────────────────
+
+// Upload audio to Cloudinary and store URL/duration in session
+app.post("/upload-audio", upload.single("audio"), async (req, res) => {
+  const { session_id } = req.body;
+  if (!session_id || !req.file) {
+    return res.status(400).json({ error: "session_id and audio file required" });
+  }
+
+  try {
+    console.log(`Uploading audio for session ${session_id}, size: ${req.file.size} bytes`);
+
+    // Check Cloudinary config
+    if (!process.env.CLOUDINARY_CLOUD_NAME) {
+      throw new Error("Cloudinary not configured. Missing env variables.");
+    }
+
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          resource_type: "auto", // let Cloudinary detect the type (video/audio)
+          folder: "meetmind_audio",
+          public_id: session_id,
+        },
+        (error, uploadResult) => {
+          if (error) {
+            console.error("Cloudinary upload error details:", error);
+            reject(error);
+          } else {
+            resolve(uploadResult);
+          }
+        }
+      );
+      uploadStream.end(req.file.buffer);
+    });
+
+    const audioUrl = result.secure_url;
+    const audioDuration = Math.round(result.duration || 0);
+
+    const upload = multer({ 
+      storage: multer.memoryStorage(),
+      limits: { fileSize: 50 * 1024 * 1024 } // 50MB max
+    });
+
+    await Session.findOneAndUpdate(
+      { session_id },
+      { audioUrl, audioDuration },
+      { upsert: true }
+    );
+
+    res.json({ audioUrl, audioDuration });
+  } catch (err) {
+    console.error("Upload-audio error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Get audio info for a session
+app.get("/audio/:session_id", async (req, res) => {
+  try {
+    const session = await Session.findOne({ session_id: req.params.session_id });
+    if (!session) return res.status(404).json({ error: "Session not found" });
+    res.json({ audioUrl: session.audioUrl, audioDuration: session.audioDuration });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
