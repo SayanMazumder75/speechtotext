@@ -124,7 +124,8 @@ const EXACT_NOISE = new Set([
   "i'm going to make a", "i'm going to make", "i'm going to",
   "hello everyone, i'm going to make",
   "subtitles by", "translated by", "transcribed by",
-  "looking at the camera",
+  "looking at the camera","you","yourself","thank you","thanks",
+  "okay","ok","hello","bye","goodbye",
   // Punctuation-only
   ".", "..", "...", " ",
 ]);
@@ -162,7 +163,15 @@ function isHallucination(text) {
   //   - short valid fragments ("This is one reason why", "I want to hear your story")
   //   - any text with real word diversity
   //   - partial sentences
+  const repeatedWords = lower.split(/\s+/);
 
+  if (repeatedWords.length >= 3) {
+    const unique = new Set(repeatedWords);
+
+    if (unique.size === 1) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -294,7 +303,7 @@ function jaccardSimilarity(a, b) {
 function isDuplicate(cacheKey, text) {
   const entry = recentTranscripts.get(cacheKey);
   if (!entry) return false;
-  if (Date.now() - entry.time > 5000) {
+  if (Date.now() - entry.time > 30000) {
     recentTranscripts.delete(cacheKey);
     return false;
   }
