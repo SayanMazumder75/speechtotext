@@ -491,14 +491,21 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
 
   try {
     // Client-side VAD signals: fraction of frames whose RMS exceeded the
-    // speech threshold over the chunk window, and the peak RMS in the
-    // chunk. When both are very low the chunk is essentially silence —
-    // we skip Whisper entirely to remove any hallucination opportunity.
+    // speech threshold over the chunk window, the peak RMS in the chunk,
+    // and the magnitude ratio in the 85–3500 Hz speech band. The first
+    // two flag silence; the third flags broadband noise (fan, keyboard,
+    // HVAC, TV) — a remote Meet participant's noisy mic looks loud on
+    // RMS but spectrally flat, so RMS alone can't reject it.
     const speechRatioRaw = req.body.speechRatio;
     const peakRmsRaw = req.body.peakRms;
+    const speechBandRatioRaw = req.body.speechBandRatio;
     const speechRatio = speechRatioRaw !== undefined ? Number(speechRatioRaw) : NaN;
     const peakRms = peakRmsRaw !== undefined ? Number(peakRmsRaw) : NaN;
+    const speechBandRatio = speechBandRatioRaw !== undefined
+      ? Number(speechBandRatioRaw)
+      : NaN;
     const hasVad = Number.isFinite(speechRatio);
+    const hasSpectral = Number.isFinite(speechBandRatio);
 
     if (
       hasVad &&
@@ -512,6 +519,27 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
         })`
       );
       return res.json({ text: "", silent: true });
+    }
+
+    // Audible but spectrally flat = broadband noise, not speech. We
+    // only apply this gate to system audio because Meet / YouTube
+    // streams are where noisy participants and ambient TV come from;
+    // the user's own mic on the Whisper path can still benefit from
+    // it, but we use a tighter threshold there to avoid clipping
+    // soft-spoken users.
+    if (hasSpectral) {
+      const noiseOnlyThreshold = source === "system" ? 0.35 : 0.30;
+      if (
+        speechBandRatio < noiseOnlyThreshold &&
+        Number.isFinite(peakRms) && peakRms >= 0.01
+      ) {
+        console.log(
+          `[${session_id}][${source}] skipped noise-only chunk ` +
+          `(speechBandRatio=${speechBandRatio.toFixed(3)}, ` +
+          `peakRms=${peakRms.toFixed(4)})`
+        );
+        return res.json({ text: "", noise: true });
+      }
     }
 
     // Language hint and biasing prompt are applied only to the mic path
@@ -538,18 +566,26 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
     // A chunk is "suspicious" if any of:
     //  - Whisper itself reports high no_speech_prob,
     //  - decoder confidence (avg_logprob) is very low,
-    //  - client VAD says <8% of frames were above the speech floor.
+    //  - client VAD says <8% of frames were above the speech floor,
+    //  - or, for system audio, the spectral speech-band ratio is in
+    //    the borderline band (audible but not strongly voiced — e.g.
+    //    a TV in the background under the speaker).
     // For suspicious chunks we apply the weak-hallucination filter.
+    const noSpeechCutoff = source === "system" ? 0.5 : 0.6;
+    const lowSpectralForSystem =
+      source === "system" && hasSpectral && speechBandRatio < 0.5;
     const suspicious =
-      whisper.noSpeechProb > 0.6 ||
+      whisper.noSpeechProb > noSpeechCutoff ||
       whisper.avgLogprob < -1.0 ||
-      (hasVad && speechRatio < 0.08);
+      (hasVad && speechRatio < 0.08) ||
+      lowSpectralForSystem;
 
     console.log(
       `[${session_id}][${source}] raw: "${original}" ` +
       `(noSpeech=${whisper.noSpeechProb.toFixed(2)}, ` +
       `lp=${whisper.avgLogprob.toFixed(2)}, ` +
-      `speechRatio=${hasVad ? speechRatio.toFixed(2) : "n/a"})`
+      `speechRatio=${hasVad ? speechRatio.toFixed(2) : "n/a"}, ` +
+      `speechBandRatio=${hasSpectral ? speechBandRatio.toFixed(2) : "n/a"})`
     );
 
     if (isHallucination(original, { suspicious })) {

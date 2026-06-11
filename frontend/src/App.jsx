@@ -173,6 +173,9 @@ function App() {
       if (Number.isFinite(vadStats.peakRms)) {
         formData.append("peakRms", String(vadStats.peakRms));
       }
+      if (Number.isFinite(vadStats.speechBandRatio)) {
+        formData.append("speechBandRatio", String(vadStats.speechBandRatio));
+      }
 
       const res = await axios.post(`${API}/transcribe`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
@@ -213,6 +216,9 @@ function App() {
       }
       if (Number.isFinite(vadStats.peakRms)) {
         formData.append("peakRms", String(vadStats.peakRms));
+      }
+      if (Number.isFinite(vadStats.speechBandRatio)) {
+        formData.append("speechBandRatio", String(vadStats.speechBandRatio));
       }
 
       const res = await axios.post(`${API}/transcribe`, formData, {
@@ -268,9 +274,10 @@ function App() {
         ? "audio/webm"
         : "audio/mp4";
 
-    // Per-window VAD identical to the system-audio path. Skips silent
-    // chunks locally and forwards speechRatio/peakRms so the server's
-    // hallucination filter knows when to be aggressive.
+    // Per-window spectral VAD identical to the system-audio path.
+    // Computes time-domain RMS plus the magnitude ratio in the
+    // 85–3500 Hz speech band, so we can distinguish speech from
+    // broadband fan / keyboard / HVAC noise on the user's mic.
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     const vadCtx = new AudioCtx();
     const vadSource = vadCtx.createMediaStreamSource(micStream);
@@ -279,11 +286,21 @@ function App() {
     analyser.smoothingTimeConstant = 0;
     vadSource.connect(analyser);
     const vadBuffer = new Float32Array(analyser.fftSize);
+    const freqByte = new Uint8Array(analyser.frequencyBinCount);
+    const sampleRate = vadCtx.sampleRate || 48000;
+    const binHz = sampleRate / analyser.fftSize;
+    const speechBandStartBin = Math.max(1, Math.floor(85 / binHz));
+    const speechBandEndBin = Math.min(
+      analyser.frequencyBinCount - 1,
+      Math.ceil(3500 / binHz),
+    );
     const SPEECH_RMS_THRESHOLD = 0.012;
 
     let speechFrames = 0;
     let totalFrames = 0;
     let peakRms = 0;
+    let chunkSpeechBandSum = 0;
+    let chunkSpectralSum = 0;
     let vadInterval = null;
 
     const stopVadInterval = () => {
@@ -297,6 +314,8 @@ function App() {
       speechFrames = 0;
       totalFrames = 0;
       peakRms = 0;
+      chunkSpeechBandSum = 0;
+      chunkSpectralSum = 0;
       stopVadInterval();
       vadInterval = setInterval(() => {
         analyser.getFloatTimeDomainData(vadBuffer);
@@ -308,6 +327,18 @@ function App() {
         if (rms > peakRms) peakRms = rms;
         if (rms > SPEECH_RMS_THRESHOLD) speechFrames++;
         totalFrames++;
+
+        analyser.getByteFrequencyData(freqByte);
+        let frameTotal = 0;
+        let frameSpeech = 0;
+        for (let i = 0; i < freqByte.length; i++) {
+          frameTotal += freqByte[i];
+          if (i >= speechBandStartBin && i <= speechBandEndBin) {
+            frameSpeech += freqByte[i];
+          }
+        }
+        chunkSpectralSum += frameTotal;
+        chunkSpeechBandSum += frameSpeech;
       }, 50);
     };
 
@@ -332,15 +363,22 @@ function App() {
       stopVadInterval();
       const speechRatio = totalFrames > 0 ? speechFrames / totalFrames : 0;
       const chunkPeakRms = peakRms;
+      const speechBandRatio =
+        chunkSpectralSum > 0 ? chunkSpeechBandSum / chunkSpectralSum : 0;
 
       if (chunks.length > 0) {
         const blob = new Blob(chunks, { type: mimeType });
         chunks = [];
         const isSilent = speechRatio < 0.03 && chunkPeakRms < 0.01;
-        if (!isSilent) {
+        const isNoiseOnly =
+          totalFrames > 0 &&
+          chunkPeakRms >= 0.01 &&
+          speechBandRatio < 0.35;
+        if (!isSilent && !isNoiseOnly) {
           await sendMicChunk(blob, sid, {
             speechRatio,
             peakRms: chunkPeakRms,
+            speechBandRatio,
           });
         }
       } else {
@@ -396,13 +434,15 @@ function App() {
       ? "audio/webm;codecs=opus"
       : "audio/webm";
 
-    // ── Lightweight VAD on the same audio stream ─────────────────────
-    // Sample RMS at ~50 ms intervals across each 5 s recording window.
-    // The resulting speechRatio (fraction of frames whose RMS exceeded
-    // the noise floor) and peakRms are sent alongside the audio so the
-    // server can avoid calling Whisper on silent / background-noise
-    // chunks — that's the regime where Whisper hallucinates "Thank
-    // you" / "Thanks" / "Bye" / "Okay" etc.
+    // ── Spectral VAD on the same audio stream ────────────────────────
+    // Pure RMS-based VAD cannot tell speech from broadband noise (fan,
+    // keyboard, HVAC, TV) because both have similar energy. Voiced
+    // speech concentrates its magnitude in the 85–3500 Hz band; flat
+    // noise spreads it across the whole spectrum. We sample both
+    // time-domain RMS (speechRatio / peakRms) and the per-frame
+    // speech-band magnitude ratio at ~50 ms intervals over each 5 s
+    // window, then forward all three to the server so it can decide
+    // whether this chunk is worth transcribing at all.
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     const vadCtx = new AudioCtx();
     const vadSource = vadCtx.createMediaStreamSource(audioStream);
@@ -411,13 +451,25 @@ function App() {
     analyser.smoothingTimeConstant = 0;
     vadSource.connect(analyser);
     const vadBuffer = new Float32Array(analyser.fftSize);
+    const freqByte = new Uint8Array(analyser.frequencyBinCount);
+    const sampleRate = vadCtx.sampleRate || 48000;
+    const binHz = sampleRate / analyser.fftSize;
+    // Voice band: 85 Hz (low male fundamental) .. 3500 Hz (top of
+    // typical formant range). Anything outside is noise / hum / hiss.
+    const speechBandStartBin = Math.max(1, Math.floor(85 / binHz));
+    const speechBandEndBin = Math.min(
+      analyser.frequencyBinCount - 1,
+      Math.ceil(3500 / binHz),
+    );
 
-    // ~ -38 dBFS. Above this we treat a frame as containing speech.
+    // ~ -38 dBFS. Above this we treat a frame as containing audio.
     const SPEECH_RMS_THRESHOLD = 0.012;
 
     let speechFrames = 0;
     let totalFrames = 0;
     let peakRms = 0;
+    let chunkSpeechBandSum = 0;
+    let chunkSpectralSum = 0;
     let vadInterval = null;
 
     const stopVadInterval = () => {
@@ -429,17 +481,20 @@ function App() {
 
     vadCleanupRef.current = () => {
       stopVadInterval();
-      try { vadSource.disconnect(); } catch {}
-      try { analyser.disconnect(); } catch {}
-      try { vadCtx.close(); } catch {}
+      try { vadSource.disconnect(); } catch { /* already disconnected */ }
+      try { analyser.disconnect(); } catch { /* already disconnected */ }
+      try { vadCtx.close(); } catch { /* already closed */ }
     };
 
     const startVadWindow = () => {
       speechFrames = 0;
       totalFrames = 0;
       peakRms = 0;
+      chunkSpeechBandSum = 0;
+      chunkSpectralSum = 0;
       stopVadInterval();
       vadInterval = setInterval(() => {
+        // Time-domain RMS — quick energy floor check.
         analyser.getFloatTimeDomainData(vadBuffer);
         let sumSq = 0;
         for (let i = 0; i < vadBuffer.length; i++) {
@@ -449,6 +504,20 @@ function App() {
         if (rms > peakRms) peakRms = rms;
         if (rms > SPEECH_RMS_THRESHOLD) speechFrames++;
         totalFrames++;
+
+        // Frequency-domain speech-band concentration. Voiced speech
+        // peaks in 85–3500 Hz; broadband noise spreads roughly flat.
+        analyser.getByteFrequencyData(freqByte);
+        let frameTotal = 0;
+        let frameSpeech = 0;
+        for (let i = 0; i < freqByte.length; i++) {
+          frameTotal += freqByte[i];
+          if (i >= speechBandStartBin && i <= speechBandEndBin) {
+            frameSpeech += freqByte[i];
+          }
+        }
+        chunkSpectralSum += frameTotal;
+        chunkSpeechBandSum += frameSpeech;
       }, 50);
     };
 
@@ -463,23 +532,32 @@ function App() {
       stopVadInterval();
       const speechRatio = totalFrames > 0 ? speechFrames / totalFrames : 0;
       const chunkPeakRms = peakRms;
+      const speechBandRatio =
+        chunkSpectralSum > 0 ? chunkSpeechBandSum / chunkSpectralSum : 0;
 
       if (systemChunksRef.current.length > 0) {
         const blob = new Blob(systemChunksRef.current, { type: mimeType });
         systemChunksRef.current = [];
 
-        // Drop chunks that are essentially silence / inaudible
-        // background. This prevents Whisper from being asked to
-        // transcribe non-speech audio, which is the single biggest
-        // source of hallucinated "Thank you" / "Bye" / "Okay" lines on
-        // Meet and YouTube. The thresholds match the server's silent-
-        // chunk gate so behavior is consistent if the server check is
-        // ever bypassed.
+        // Two reasons to drop a chunk locally without calling Whisper:
+        //
+        //  - isSilent: nothing audible at all (existing gate).
+        //  - isNoiseOnly: audible energy but spectrally flat, e.g. a
+        //    remote participant's fan / keyboard / HVAC. Broadband
+        //    noise concentrates < ~20% of its magnitude in the speech
+        //    band, voiced speech > ~50%. We use 0.35 as the cutoff to
+        //    leave headroom for soft / distant speech.
         const isSilent = speechRatio < 0.03 && chunkPeakRms < 0.01;
-        if (!isSilent) {
+        const isNoiseOnly =
+          totalFrames > 0 &&
+          chunkPeakRms >= 0.01 &&
+          speechBandRatio < 0.35;
+
+        if (!isSilent && !isNoiseOnly) {
           await sendAudioChunk(blob, sid, {
             speechRatio,
             peakRms: chunkPeakRms,
+            speechBandRatio,
           });
         }
       }
@@ -696,7 +774,17 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
-          audio: { echoCancellation: false, noiseSuppression: false },
+          // Re-enable WebRTC's noise suppressor and echo canceller on
+          // the captured system-audio track. When a remote Meet
+          // participant's mic picks up fan / keyboard / HVAC / TV
+          // noise, this lets the browser strip it before our pipeline
+          // ever sees the audio. autoGainControl stays off so the
+          // mixed Meet level isn't pumped during silences.
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: false,
+          },
         });
 
         displayStream.getVideoTracks().forEach((t) => t.stop());
