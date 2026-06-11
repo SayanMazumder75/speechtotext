@@ -56,6 +56,10 @@ function App() {
   const systemMediaRecorderRef = useRef(null);
   const systemChunksRef = useRef([]);
   const displayStreamRef = useRef(null);
+  // Cleanup hook for the per-session VAD analyser/audio-context that
+  // measures speech presence on the system-audio stream. Called when
+  // stopSession runs so we don't leak an AudioContext per session.
+  const vadCleanupRef = useRef(null);
 
   const captureModeLabel = !isRunning
     ? "Idle"
@@ -169,7 +173,7 @@ function App() {
     }
   };
 
-  const sendAudioChunk = async (blob, sid) => {
+  const sendAudioChunk = async (blob, sid, vadStats = {}) => {
     if (!blob || blob.size < 1000 || !sid) return;
     try {
       const formData = new FormData();
@@ -177,6 +181,15 @@ function App() {
       formData.append("session_id", sid);
       formData.append("source", "system");
       formData.append("language", inputLangRef.current);
+      // Forward client-side VAD signals so the server can decide whether
+      // to call Whisper at all and how aggressive its hallucination
+      // filter should be for this chunk.
+      if (Number.isFinite(vadStats.speechRatio)) {
+        formData.append("speechRatio", String(vadStats.speechRatio));
+      }
+      if (Number.isFinite(vadStats.peakRms)) {
+        formData.append("peakRms", String(vadStats.peakRms));
+      }
 
       const res = await axios.post(`${API}/transcribe`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
@@ -305,6 +318,62 @@ function App() {
       ? "audio/webm;codecs=opus"
       : "audio/webm";
 
+    // ── Lightweight VAD on the same audio stream ─────────────────────
+    // Sample RMS at ~50 ms intervals across each 5 s recording window.
+    // The resulting speechRatio (fraction of frames whose RMS exceeded
+    // the noise floor) and peakRms are sent alongside the audio so the
+    // server can avoid calling Whisper on silent / background-noise
+    // chunks — that's the regime where Whisper hallucinates "Thank
+    // you" / "Thanks" / "Bye" / "Okay" etc.
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const vadCtx = new AudioCtx();
+    const vadSource = vadCtx.createMediaStreamSource(audioStream);
+    const analyser = vadCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0;
+    vadSource.connect(analyser);
+    const vadBuffer = new Float32Array(analyser.fftSize);
+
+    // ~ -38 dBFS. Above this we treat a frame as containing speech.
+    const SPEECH_RMS_THRESHOLD = 0.012;
+
+    let speechFrames = 0;
+    let totalFrames = 0;
+    let peakRms = 0;
+    let vadInterval = null;
+
+    const stopVadInterval = () => {
+      if (vadInterval) {
+        clearInterval(vadInterval);
+        vadInterval = null;
+      }
+    };
+
+    vadCleanupRef.current = () => {
+      stopVadInterval();
+      try { vadSource.disconnect(); } catch {}
+      try { analyser.disconnect(); } catch {}
+      try { vadCtx.close(); } catch {}
+    };
+
+    const startVadWindow = () => {
+      speechFrames = 0;
+      totalFrames = 0;
+      peakRms = 0;
+      stopVadInterval();
+      vadInterval = setInterval(() => {
+        analyser.getFloatTimeDomainData(vadBuffer);
+        let sumSq = 0;
+        for (let i = 0; i < vadBuffer.length; i++) {
+          sumSq += vadBuffer[i] * vadBuffer[i];
+        }
+        const rms = Math.sqrt(sumSq / vadBuffer.length);
+        if (rms > peakRms) peakRms = rms;
+        if (rms > SPEECH_RMS_THRESHOLD) speechFrames++;
+        totalFrames++;
+      }, 50);
+    };
+
     const recorder = new MediaRecorder(audioStream, { mimeType });
     systemMediaRecorderRef.current = recorder;
 
@@ -313,10 +382,28 @@ function App() {
     };
 
     recorder.onstop = async () => {
+      stopVadInterval();
+      const speechRatio = totalFrames > 0 ? speechFrames / totalFrames : 0;
+      const chunkPeakRms = peakRms;
+
       if (systemChunksRef.current.length > 0) {
         const blob = new Blob(systemChunksRef.current, { type: mimeType });
         systemChunksRef.current = [];
-        await sendAudioChunk(blob, sid);
+
+        // Drop chunks that are essentially silence / inaudible
+        // background. This prevents Whisper from being asked to
+        // transcribe non-speech audio, which is the single biggest
+        // source of hallucinated "Thank you" / "Bye" / "Okay" lines on
+        // Meet and YouTube. The thresholds match the server's silent-
+        // chunk gate so behavior is consistent if the server check is
+        // ever bypassed.
+        const isSilent = speechRatio < 0.03 && chunkPeakRms < 0.01;
+        if (!isSilent) {
+          await sendAudioChunk(blob, sid, {
+            speechRatio,
+            peakRms: chunkPeakRms,
+          });
+        }
       }
 
       if (
@@ -325,13 +412,19 @@ function App() {
         displayStream.active
       ) {
         systemChunksRef.current = [];
+        startVadWindow();
         recorder.start();
         setTimeout(() => {
           if (recorder.state === "recording") recorder.stop();
         }, 5000);
+      } else if (vadCleanupRef.current) {
+        // Session ended — release the VAD analyser/audio-context.
+        vadCleanupRef.current();
+        vadCleanupRef.current = null;
       }
     };
 
+    startVadWindow();
     recorder.start();
     setTimeout(() => {
       if (recorder.state === "recording") recorder.stop();
@@ -583,6 +676,11 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
         systemMediaRecorderRef.current.stop();
       } catch {}
       systemMediaRecorderRef.current = null;
+    }
+
+    if (vadCleanupRef.current) {
+      vadCleanupRef.current();
+      vadCleanupRef.current = null;
     }
 
     if (displayStreamRef.current) {

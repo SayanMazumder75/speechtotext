@@ -117,7 +117,17 @@ async function callGroqWhisper(audioBuffer, mimeType) {
         contentType: mimeType || "audio/webm",
       });
       formData.append("model", "whisper-large-v3");
-      formData.append("response_format", "json");
+      // verbose_json gives us per-segment no_speech_prob and avg_logprob,
+      // which are the strongest signals for detecting Whisper's
+      // silence-induced hallucinations ("Thank you", "Thanks for
+      // watching", "Bye", etc.). Without these we can only filter on
+      // the text itself, after the damage is done.
+      formData.append("response_format", "verbose_json");
+      // Greedy decoding (temperature=0) is documented as the single
+      // biggest mitigation against Whisper hallucinations on near-silent
+      // audio. Sampling at higher temperatures is what produces the
+      // creative "thanks for watching, see you next time" tails.
+      formData.append("temperature", "0");
 
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
@@ -129,52 +139,148 @@ async function callGroqWhisper(audioBuffer, mimeType) {
       if (!response.ok) throw new Error(`Groq ${response.status}`);
 
       const data = await response.json();
-      return data.text?.trim() || "";
+      const text = (data.text || "").trim();
+
+      // Aggregate per-segment confidence so the caller can decide how
+      // suspicious this chunk is overall.
+      const segments = Array.isArray(data.segments) ? data.segments : [];
+      let noSpeechProb = 0;
+      let avgLogprob = 0;
+      let compressionRatio = 0;
+      if (segments.length > 0) {
+        for (const s of segments) {
+          noSpeechProb += Number(s.no_speech_prob || 0);
+          avgLogprob += Number(s.avg_logprob || 0);
+          compressionRatio += Number(s.compression_ratio || 0);
+        }
+        noSpeechProb /= segments.length;
+        avgLogprob /= segments.length;
+        compressionRatio /= segments.length;
+      }
+      return { text, noSpeechProb, avgLogprob, compressionRatio };
     } catch (err) {
       console.error(`Whisper attempt ${attempt + 1} failed:`, err.message);
     }
   }
-  return "";
+  return { text: "", noSpeechProb: 1, avgLogprob: -10, compressionRatio: 0 };
 }
 
 // ── Hallucination Filter ──────────────────────────────────────────────────────
+//
+// Two-tier filter:
+//
+//   HARD patterns are dropped unconditionally — these are phrases Whisper
+//   is documented to emit on silence/non-speech audio and never appear as
+//   real meeting content (YouTube tail phrases, "Subtitles by ...", etc).
+//
+//   WEAK patterns are dropped only when the chunk looks "suspicious" —
+//   i.e. the client's VAD ratio is low or Whisper's own no_speech_prob /
+//   avg_logprob indicates poor confidence. Single tokens like "yes",
+//   "no", "okay", "hello" can be perfectly valid speech, so we keep them
+//   when there is acoustic evidence of actual speech in the chunk.
 
-const EXACT_NOISE = new Set([
-  "thank you", "thanks", "bye", "goodbye", "hello", "ok", "okay",
-  "hmm", "um", "uh", "ah", "oh", "no", "yes",
-  "subscribe", "like and subscribe", "please subscribe",
-  "hello everyone", "welcome back", "please like",
-  "i'm going to make a", "i'm going to make", "i'm going to",
-  "hello everyone, i'm going to make",
-  "subtitles by", "translated by", "transcribed by",
-  "looking at the camera","you","yourself","thank you","thanks",
-  "okay","ok","hello","bye","goodbye",
-  ".", "..", "...", " ",
-]);
+const HARD_HALLUCINATION_PATTERNS = [
+  // "Thanks for watching", "Thanks everyone", "Thanks!" — the YouTube tail.
+  /^thanks?( for watching| for listening| everyone| guys| all| again)*[.!? ]*$/,
+  /^thank you( so much| very much| all| everyone| for watching| for listening)*[.!? ]*$/,
+  // "Bye bye", "Goodbye", "See you in the next video", etc.
+  /^(bye+|goodbye|see ya|see you( in the next video| next time| later)?)[.!? ]*$/,
+  // "Please subscribe", "Like and subscribe to my channel", "Don't forget to subscribe".
+  /^(please )?(like and )?subscribe( to (my|the|our) channel)?[.!? ]*$/,
+  /^(don.?t forget to )?(like|subscribe|comment)([ ,]+(and|&)[ ,]+(like|subscribe|comment))*[.!? ]*$/,
+  // "Subtitles by Amara.org community", "Translated by ...", "Captions by ...".
+  /^subtitles? (by|provided by|from)[\w\s.\-]+$/,
+  /^(translated|transcribed|captions|closed captions) (by|from)[\w\s.\-]+$/,
+  // Standalone media markers Whisper sometimes emits as text.
+  /^\[?(music|applause|laughter|silence|noise|inaudible|foreign|crosstalk)\]?[.!? ]*$/,
+  // Single-token Whisper hallucinations.
+  /^you[.!? ]*$/,
+  /^yourself[.!? ]*$/,
+  // Specific phrases observed in this project's prior filter.
+  /^looking at the camera[.!? ]*$/,
+  /^i'?m going to make( a)?[.!? ]*$/,
+  /^hello everyone,? i'?m going to make( a)?[.!? ]*$/,
+];
 
-const MEDIA_MARKER_RE = /^\[?(music|applause|laughter|foreign|inaudible|silence|noise)\]?$/i;
+const WEAK_HALLUCINATION_PATTERNS = [
+  /^thanks?[.!? ]*$/,
+  /^thank you[.!? ]*$/,
+  /^hello[.!? ]*$/,
+  /^hi[.!? ]*$/,
+  /^hey[.!? ]*$/,
+  /^bye[.!? ]*$/,
+  /^okay?[.!? ]*$/,
+  /^yes[.!? ]*$/,
+  /^no[.!? ]*$/,
+  /^uh[ -]?huh[.!? ]*$/,
+  /^mm[ -]?hmm[.!? ]*$/,
+  /^hmm+[.!? ]*$/,
+  /^um+[.!? ]*$/,
+  /^uh+[.!? ]*$/,
+  /^ah+[.!? ]*$/,
+  /^oh+[.!? ]*$/,
+];
 
-function isHallucination(text) {
+const MEDIA_MARKER_RE = /^\[?(music|applause|laughter|foreign|inaudible|silence|noise|crosstalk)\]?[.!? ]*$/i;
+
+function normalizeForFilter(text) {
+  return text
+    .toLowerCase()
+    // Strip smart quotes and stray quote-like characters.
+    .replace(/[\u201c\u201d"`']/g, "")
+    .trim()
+    // Collapse repeated identical tokens: "bye bye bye" → "bye",
+    // "okay, okay, okay." → "okay". Catches Whisper's stutter-on-noise
+    // pattern without affecting ordinary speech.
+    .replace(/^([\p{L}']+)([ .,!?]+\1)+[ .,!?]*$/u, "$1");
+}
+
+function isHallucination(text, opts = {}) {
+  const suspicious = !!opts.suspicious;
+
   if (!text) return true;
   const trimmed = text.trim();
-  const lower = trimmed.toLowerCase();
 
-  if (EXACT_NOISE.has(lower)) return true;
+  // Pure punctuation / whitespace.
+  if (/^[\s.,!?;:\-–—]*$/.test(trimmed)) return true;
+  // Single character output.
+  if (trimmed.length <= 1) return true;
   if (MEDIA_MARKER_RE.test(trimmed)) return true;
-  if (/^[\s.,!?;:\-–—]+$/.test(trimmed)) return true;
 
-  const words = lower.split(/\s+/).filter(Boolean);
-  if (words.length >= 4) {
-    const unique = new Set(words);
-    if (unique.size <= 2) return true;
+  // Repeated single weak token like "okay okay okay" or "bye bye" is
+  // always a hallucination, regardless of suspicious flag. Run this on
+  // the pre-collapse tokens so we don't miss it after normalization.
+  const rawTokens = trimmed
+    .toLowerCase()
+    .replace(/[.,!?;:\-–—]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (
+    rawTokens.length >= 2 &&
+    new Set(rawTokens).size === 1 &&
+    WEAK_HALLUCINATION_PATTERNS.some((re) => re.test(rawTokens[0]))
+  ) {
+    return true;
   }
 
-  if (trimmed.length <= 1) return true;
+  const norm = normalizeForFilter(trimmed);
 
-  const repeatedWords = lower.split(/\s+/);
-  if (repeatedWords.length >= 3) {
-    const unique = new Set(repeatedWords);
-    if (unique.size === 1) return true;
+  for (const re of HARD_HALLUCINATION_PATTERNS) {
+    if (re.test(norm)) return true;
+  }
+
+  const tokens = norm.split(/\s+/).filter(Boolean);
+
+  // Long output that's just two tokens cycling — classic stuck Whisper.
+  if (tokens.length >= 4 && new Set(tokens).size <= 2) return true;
+
+  if (suspicious) {
+    for (const re of WEAK_HALLUCINATION_PATTERNS) {
+      if (re.test(norm)) return true;
+    }
+    // On a suspicious chunk, very short outputs are almost always
+    // Whisper guessing on silence/noise.
+    if (tokens.length <= 2 && trimmed.length < 12) return true;
   }
 
   return false;
@@ -351,12 +457,52 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
   }
 
   try {
-    const original = await callGroqWhisper(req.file.buffer, req.file.mimetype);
+    // Client-side VAD signals: fraction of frames whose RMS exceeded the
+    // speech threshold over the chunk window, and the peak RMS in the
+    // chunk. When both are very low the chunk is essentially silence —
+    // we skip Whisper entirely to remove any hallucination opportunity.
+    const speechRatioRaw = req.body.speechRatio;
+    const peakRmsRaw = req.body.peakRms;
+    const speechRatio = speechRatioRaw !== undefined ? Number(speechRatioRaw) : NaN;
+    const peakRms = peakRmsRaw !== undefined ? Number(peakRmsRaw) : NaN;
+    const hasVad = Number.isFinite(speechRatio);
+
+    if (
+      hasVad &&
+      speechRatio < 0.02 &&
+      (!Number.isFinite(peakRms) || peakRms < 0.01)
+    ) {
+      console.log(
+        `[${session_id}][${source}] skipped silent chunk ` +
+        `(speechRatio=${speechRatio.toFixed(3)}, peakRms=${
+          Number.isFinite(peakRms) ? peakRms.toFixed(4) : "n/a"
+        })`
+      );
+      return res.json({ text: "", silent: true });
+    }
+
+    const whisper = await callGroqWhisper(req.file.buffer, req.file.mimetype);
+    const original = whisper.text;
     if (!original) return res.json({ text: "" });
 
-    console.log(`[${session_id}][${source}] raw: ${original}`);
+    // A chunk is "suspicious" if any of:
+    //  - Whisper itself reports high no_speech_prob,
+    //  - decoder confidence (avg_logprob) is very low,
+    //  - client VAD says <8% of frames were above the speech floor.
+    // For suspicious chunks we apply the weak-hallucination filter.
+    const suspicious =
+      whisper.noSpeechProb > 0.6 ||
+      whisper.avgLogprob < -1.0 ||
+      (hasVad && speechRatio < 0.08);
 
-    if (isHallucination(original)) {
+    console.log(
+      `[${session_id}][${source}] raw: "${original}" ` +
+      `(noSpeech=${whisper.noSpeechProb.toFixed(2)}, ` +
+      `lp=${whisper.avgLogprob.toFixed(2)}, ` +
+      `speechRatio=${hasVad ? speechRatio.toFixed(2) : "n/a"})`
+    );
+
+    if (isHallucination(original, { suspicious })) {
       console.log(`[${session_id}] filtered hallucination: "${original}"`);
       return res.json({ text: "" });
     }
