@@ -14,18 +14,14 @@ import {
   RotateCcw,
   Loader2
 } from "lucide-react";
+import { getToken } from "./auth";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 async function callClaude(prompt) {
-  const res = await fetch(`${API}/ai-insights`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt })
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data;
+  const res = await axios.post(`${API}/ai-insights`, { prompt });
+  if (res.data.error) throw new Error(res.data.error);
+  return res.data;
 }
 
 function Section({ icon: Icon, title, color, children, defaultOpen = false }) {

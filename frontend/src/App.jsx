@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
+import { getToken } from "./auth";
 import {
   Moon,
   Sun,
@@ -8,7 +9,7 @@ import {
   Download,
   Mic,
   Monitor,
-  Sparkles
+  Sparkles,
 } from "lucide-react";
 import { createReportData } from "./utils/transcriptFormatter";
 import { exportPDF } from "./utils/exportPdf";
@@ -69,7 +70,7 @@ function App() {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
-      hour12: false
+      hour12: false,
     });
 
   const formatDuration = (seconds) => {
@@ -77,17 +78,23 @@ function App() {
     const hours = Math.floor(safeSeconds / 3600);
     const minutes = Math.floor((safeSeconds % 3600) / 60);
     const remainingSeconds = safeSeconds % 60;
-    const parts = [minutes, remainingSeconds].map((value) => String(value).padStart(2, "0"));
-    return hours > 0 ? `${hours}:${parts[0]}:${parts[1]}` : `${parts[0]}:${parts[1]}`;
+    const parts = [minutes, remainingSeconds].map((value) =>
+      String(value).padStart(2, "0"),
+    );
+    return hours > 0
+      ? `${hours}:${parts[0]}:${parts[1]}`
+      : `${parts[0]}:${parts[1]}`;
   };
 
   const parseTranscriptLine = (line) => {
-    const timestampedMatch = line.match(/^\[(MIC|SYSTEM)\]\s+\[(.*?)\]\s*(.*)$/);
+    const timestampedMatch = line.match(
+      /^\[(MIC|SYSTEM)\]\s+\[(.*?)\]\s*(.*)$/,
+    );
     if (timestampedMatch) {
       return {
         source: timestampedMatch[1].toLowerCase(),
         timestamp: timestampedMatch[2],
-        text: timestampedMatch[3] || ""
+        text: timestampedMatch[3] || "",
       };
     }
 
@@ -96,7 +103,11 @@ function App() {
     }
 
     if (line.startsWith("[SYSTEM] ")) {
-      return { source: "system", timestamp: "", text: line.replace("[SYSTEM] ", "") };
+      return {
+        source: "system",
+        timestamp: "",
+        text: line.replace("[SYSTEM] ", ""),
+      };
     }
 
     return { source: "system", timestamp: "", text: line };
@@ -107,9 +118,10 @@ function App() {
       ? `[${line.source.toUpperCase()}] [${line.timestamp}] ${line.text}`
       : `[${line.source.toUpperCase()}] ${line.text}`;
 
-  const filteredSessions = sessions.filter((session) =>
-    session.label.toLowerCase().includes(sessionQuery.toLowerCase()) ||
-    session.id.toLowerCase().includes(sessionQuery.toLowerCase())
+  const filteredSessions = sessions.filter(
+    (session) =>
+      session.label.toLowerCase().includes(sessionQuery.toLowerCase()) ||
+      session.id.toLowerCase().includes(sessionQuery.toLowerCase()),
   );
 
   useEffect(() => {
@@ -128,7 +140,7 @@ function App() {
 
     const timer = setInterval(() => {
       setSessionSeconds(
-        Math.floor((Date.now() - sessionStartAtRef.current) / 1000)
+        Math.floor((Date.now() - sessionStartAtRef.current) / 1000),
       );
     }, 1000);
 
@@ -142,11 +154,16 @@ function App() {
 
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(
-        text
+        text,
       )}`;
       const res = await fetch(url);
       const data = await res.json();
-      return data[0].map((c) => c[0]).join(" ").trim() || text;
+      return (
+        data[0]
+          .map((c) => c[0])
+          .join(" ")
+          .trim() || text
+      );
     } catch {
       return text;
     }
@@ -162,7 +179,7 @@ function App() {
       formData.append("language", inputLangRef.current);
 
       const res = await axios.post(`${API}/transcribe`, formData, {
-        headers: { "Content-Type": "multipart/form-data" }
+        headers: { "Content-Type": "multipart/form-data" },
       });
 
       if (res.data.text) {
@@ -171,8 +188,8 @@ function App() {
           {
             source: "system",
             text: res.data.text,
-            timestamp: res.data.timestamp || formatTime(new Date())
-          }
+            timestamp: res.data.timestamp || formatTime(new Date()),
+          },
         ]);
       }
     } catch (err) {
@@ -200,16 +217,22 @@ function App() {
 
       if (!transcript) return;
 
-      const english = await translateToEnglish(transcript, inputLangRef.current);
+      const english = await translateToEnglish(
+        transcript,
+        inputLangRef.current,
+      );
 
       const timestamp = formatTime(new Date());
 
-      setLines((prev) => [...prev, { source: "mic", text: english, timestamp }]);
+      setLines((prev) => [
+        ...prev,
+        { source: "mic", text: english, timestamp },
+      ]);
 
       try {
         await axios.post(`${API}/push`, {
           session_id: sid,
-          text: `[MIC] [${timestamp}] ${english}`
+          text: `[MIC] [${timestamp}] ${english}`,
         });
       } catch {}
     };
@@ -287,18 +310,24 @@ function App() {
         console.warn("No system audio stream available – recording mic only");
       }
 
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
 
       // Fallback: mic only if no system audio
       if (!systemStream || systemStream.getAudioTracks().length === 0) {
-        const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "audio/mp4";
         const recorder = new MediaRecorder(micStream, { mimeType });
         const chunks = [];
-        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunks.push(e.data);
+        };
         recorder.onstop = async () => {
           const blob = new Blob(chunks, { type: mimeType });
           await uploadAudioRecording(sid, blob);
-          micStream.getTracks().forEach(t => t.stop());
+          micStream.getTracks().forEach((t) => t.stop());
         };
         recorder.start(1000);
         setAudioRecorder(recorder);
@@ -316,15 +345,19 @@ function App() {
       systemSource.connect(destination);
 
       const mixedStream = destination.stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "audio/mp4";
       const recorder = new MediaRecorder(mixedStream, { mimeType });
       const chunks = [];
 
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
       recorder.onstop = async () => {
         const blob = new Blob(chunks, { type: mimeType });
         await uploadAudioRecording(sid, blob);
-        micStream.getTracks().forEach(t => t.stop());
+        micStream.getTracks().forEach((t) => t.stop());
         audioContext.close();
       };
       recorder.start(1000);
@@ -342,7 +375,7 @@ function App() {
     formData.append("session_id", sessionId);
     try {
       const res = await axios.post(`${API}/upload-audio`, formData, {
-        headers: { "Content-Type": "multipart/form-data" }
+        headers: { "Content-Type": "multipart/form-data" },
       });
       setAudioUrl(res.data.audioUrl);
       setAudioDuration(res.data.audioDuration);
@@ -358,7 +391,7 @@ function App() {
       const response = await fetch(audioUrl);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
+      const a = document.createElement("a");
       a.href = url;
       a.download = `recording_${selectedSession || sessionId}.webm`;
       document.body.appendChild(a);
@@ -377,7 +410,9 @@ function App() {
       return;
     }
     try {
-      const transcriptRes = await axios.get(`${API}/transcript/${selectedSession}`);
+      const transcriptRes = await axios.get(
+        `${API}/transcript/${selectedSession}`,
+      );
       const transcriptText = transcriptRes.data.text;
       if (!transcriptText.trim()) {
         setErrorMsg("Transcript is empty.");
@@ -434,7 +469,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
 
     try {
       const res = await axios.post(`${API}/start-session`, {
-        language: inputLangRef.current
+        language: inputLangRef.current,
       });
 
       const newSessionId = res.data.session_id;
@@ -452,7 +487,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
-          audio: { echoCancellation: false, noiseSuppression: false }
+          audio: { echoCancellation: false, noiseSuppression: false },
         });
 
         displayStream.getVideoTracks().forEach((t) => t.stop());
@@ -474,7 +509,9 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           startMicrophoneRecording(newSessionId, displayStream);
         } else {
           displayStream.getTracks().forEach((t) => t.stop());
-          setSystemAudioTip("Tip: tick 'Share tab audio' in the screen share dialog.");
+          setSystemAudioTip(
+            "Tip: tick 'Share tab audio' in the screen share dialog.",
+          );
           // Start recording with mic only
           startMicrophoneRecording(newSessionId, null);
         }
@@ -564,15 +601,15 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     const sessionName = selectedSession || sessionId || "Current Session";
     const report = createReportData(lines, sessionName);
     if (insights) {
-      report.summary    = insights.summary    || "";
-      report.keyPoints  = insights.keyPoints  || [];
+      report.summary = insights.summary || "";
+      report.keyPoints = insights.keyPoints || [];
       report.flashcards = insights.flashcards || [];
-      report.quiz       = insights.quiz       || [];
+      report.quiz = insights.quiz || [];
     } else {
-      report.summary    = "";
-      report.keyPoints  = [];
+      report.summary = "";
+      report.keyPoints = [];
       report.flashcards = [];
-      report.quiz       = [];
+      report.quiz = [];
     }
     exportPDF(report);
   };
@@ -595,15 +632,15 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     const sessionName = selectedSession || sessionId || "Current Session";
     const report = createReportData(lines, sessionName);
     if (insights) {
-      report.summary    = insights.summary    || "";
-      report.keyPoints  = insights.keyPoints  || [];
+      report.summary = insights.summary || "";
+      report.keyPoints = insights.keyPoints || [];
       report.flashcards = insights.flashcards || [];
-      report.quiz       = insights.quiz       || [];
+      report.quiz = insights.quiz || [];
     } else {
-      report.summary    = "";
-      report.keyPoints  = [];
+      report.summary = "";
+      report.keyPoints = [];
       report.flashcards = [];
-      report.quiz       = [];
+      report.quiz = [];
     }
     exportWord(report);
   };
@@ -662,7 +699,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
             <div key={i} className="prose-mic-text">
               {g.text}
             </div>
-          )
+          ),
         )}
       </div>
     );
@@ -699,11 +736,19 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
             <Square size={18} /> Stop
           </button>
 
-          <button onClick={downloadPDF} className="main-btn" disabled={isRunning}>
+          <button
+            onClick={downloadPDF}
+            className="main-btn"
+            disabled={isRunning}
+          >
             <Download size={18} /> PDF
           </button>
 
-          <button onClick={downloadWord} className="main-btn" disabled={isRunning}>
+          <button
+            onClick={downloadWord}
+            className="main-btn"
+            disabled={isRunning}
+          >
             <Download size={18} /> Word
           </button>
 
@@ -730,7 +775,9 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
             </select>
           </div>
 
-          <div className="dropdown-hint">Affects microphone transcription only.</div>
+          <div className="dropdown-hint">
+            Affects microphone transcription only.
+          </div>
 
           {!isRunning && (
             <>
@@ -780,13 +827,22 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
 
         <div className="status-badge">Mode: {captureModeLabel}</div>
 
-        <div className="status-badge timer-badge">Timer: {formatDuration(sessionSeconds)}</div>
+        <div className="status-badge timer-badge">
+          Timer: {formatDuration(sessionSeconds)}
+        </div>
 
         <div
-          className={audioSources.includes("mic") ? "audio-dot active" : "audio-dot"}
+          className={
+            audioSources.includes("mic") ? "audio-dot active" : "audio-dot"
+          }
         />
-        <Mic size={14} style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }} />
-        <span style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }}>Mic</span>
+        <Mic
+          size={14}
+          style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }}
+        />
+        <span style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }}>
+          Mic
+        </span>
 
         <div
           className={
@@ -807,8 +863,8 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           {inputLang === "bn-IN"
             ? "Bengali"
             : inputLang === "hi-IN"
-            ? "Hindi"
-            : "English"}
+              ? "Hindi"
+              : "English"}
         </span>
       </div>
 
@@ -832,7 +888,9 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           </div>
           <div className="recording-content">
             {isRecordingAudio ? (
-              <div className="recording-indicator">🔴 Recording in progress...</div>
+              <div className="recording-indicator">
+                🔴 Recording in progress...
+              </div>
             ) : (
               <>
                 <audio controls src={audioUrl} className="audio-player" />
@@ -840,11 +898,16 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
                   <button onClick={downloadAudio} className="recording-btn">
                     <Download size={14} /> Download
                   </button>
-                  <button onClick={regenerateInsightsFromTranscript} className="recording-btn">
+                  <button
+                    onClick={regenerateInsightsFromTranscript}
+                    className="recording-btn"
+                  >
                     <Sparkles size={14} /> Regenerate AI Insights
                   </button>
                 </div>
-                <div className="recording-duration">Duration: {formatDuration(audioDuration)}</div>
+                <div className="recording-duration">
+                  Duration: {formatDuration(audioDuration)}
+                </div>
               </>
             )}
           </div>
@@ -866,7 +929,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
             micRef,
             isRunning
               ? "Waiting for microphone input..."
-              : "Start a session to capture microphone text here."
+              : "Start a session to capture microphone text here.",
           )}
         </div>
 
@@ -881,7 +944,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
               ? audioSources.includes("system")
                 ? "Waiting for system audio text..."
                 : "Share tab audio to populate this panel."
-              : "Start a session and share tab audio to capture system text here."
+              : "Start a session and share tab audio to capture system text here.",
           )}
         </div>
       </div>
