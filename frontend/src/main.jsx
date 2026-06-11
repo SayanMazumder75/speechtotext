@@ -1,11 +1,53 @@
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
-import App from './App.jsx'
-import InsightsPanel from './InsightsPanel.jsx'
+/**
+ * main.jsx — Speech App Entry Point
+ *
+ * Imports auth.js FIRST to register postMessage listener before any renders.
+ * Sets up global Axios interceptor that auto-attaches Bearer token.
+ */
 
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
+import "./auth"; // ← MUST be first import — registers postMessage listener
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import axios from "axios";
+import { getToken, clearToken } from "./auth";
+import App from "./App";
+import "./index.css";
+
+// ── Global Axios Interceptor ──────────────────────────────────────────────────
+// Attaches Authorization: Bearer <token> to every outgoing request automatically.
+// No need to manually add headers in any API call throughout the app.
+
+axios.interceptors.request.use(
+  (config) => {
+    const token = getToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// ── Response Interceptor — handle 401 ────────────────────────────────────────
+// If token expired or invalid, clear it so user gets re-authenticated.
+
+axios.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      console.warn("[SpeechApp] 401 received — token invalid or expired. Clearing.");
+      clearToken();
+      // Optionally: show an error UI or notify user to reload MeetMind
+    }
+    return Promise.reject(error);
+  }
+);
+
+// ── Mount App ─────────────────────────────────────────────────────────────────
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
     <App />
-  </StrictMode>,
-)
+  </React.StrictMode>
+);
