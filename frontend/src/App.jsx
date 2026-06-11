@@ -66,6 +66,14 @@ function App() {
   const micWhisperStreamRef = useRef(null);
   const micWhisperCleanupRef = useRef(null);
 
+  // Cross-source dedup: when SYSTEM flushes, the server may strip
+  // recently-rendered MIC echoes from the persisted transcript and
+  // return them in `supersedes`. We honour those by filtering `lines`,
+  // and we keep them around briefly so a still-in-flight mic
+  // /transcribe response that arrives AFTER the system supersedes
+  // can also be filtered out (race window).
+  const supersedesQueueRef = useRef([]);
+
   const captureModeLabel = !isRunning
     ? "Idle"
     : audioSources.includes("mic") && audioSources.includes("system")
@@ -156,6 +164,38 @@ function App() {
     return () => clearInterval(timer);
   }, [isRunning]);
 
+  // Cross-source dedup helpers. Used when /transcribe returns a
+  // `supersedes` array — the server has decided one or more recently
+  // rendered MIC lines were echoes of new SYSTEM content and stripped
+  // them from the persisted transcript. We mirror that on the live
+  // view and remember the triples briefly so a late-arriving
+  // /transcribe response that contains the same line is also dropped.
+  const supersedesMatches = (line, item) =>
+    item &&
+    item.source === line.source &&
+    item.timestamp === line.timestamp &&
+    item.text === line.text;
+
+  const isSupersededLine = (line) => {
+    const now = Date.now();
+    supersedesQueueRef.current = supersedesQueueRef.current.filter(
+      (e) => now - e.t < 8000,
+    );
+    return supersedesQueueRef.current.some((e) => supersedesMatches(line, e));
+  };
+
+  const applySupersedes = (items) => {
+    if (!Array.isArray(items) || items.length === 0) return;
+    const now = Date.now();
+    supersedesQueueRef.current = [
+      ...supersedesQueueRef.current.filter((e) => now - e.t < 8000),
+      ...items.map((x) => ({ ...x, t: now })),
+    ];
+    setLines((prev) =>
+      prev.filter((line) => !items.some((s) => supersedesMatches(line, s))),
+    );
+  };
+
   const sendAudioChunk = async (blob, sid, vadStats = {}) => {
     if (!blob || blob.size < 1000 || !sid) return;
     try {
@@ -181,15 +221,19 @@ function App() {
         headers: { "Content-Type": "multipart/form-data" },
       });
 
+      if (Array.isArray(res.data.supersedes) && res.data.supersedes.length > 0) {
+        applySupersedes(res.data.supersedes);
+      }
+
       if (res.data.text) {
-        setLines((prev) => [
-          ...prev,
-          {
-            source: "system",
-            text: res.data.text,
-            timestamp: res.data.timestamp || formatTime(new Date()),
-          },
-        ]);
+        const newLine = {
+          source: "system",
+          text: res.data.text,
+          timestamp: res.data.timestamp || formatTime(new Date()),
+        };
+        if (!isSupersededLine(newLine)) {
+          setLines((prev) => [...prev, newLine]);
+        }
       }
     } catch (err) {
       console.error("Transcribe error:", err);
@@ -225,15 +269,19 @@ function App() {
         headers: { "Content-Type": "multipart/form-data" },
       });
 
+      if (Array.isArray(res.data.supersedes) && res.data.supersedes.length > 0) {
+        applySupersedes(res.data.supersedes);
+      }
+
       if (res.data.text) {
-        setLines((prev) => [
-          ...prev,
-          {
-            source: "mic",
-            text: res.data.text,
-            timestamp: res.data.timestamp || formatTime(new Date()),
-          },
-        ]);
+        const newLine = {
+          source: "mic",
+          text: res.data.text,
+          timestamp: res.data.timestamp || formatTime(new Date()),
+        };
+        if (!isSupersededLine(newLine)) {
+          setLines((prev) => [...prev, newLine]);
+        }
       }
     } catch (err) {
       console.error("Mic transcribe error:", err);

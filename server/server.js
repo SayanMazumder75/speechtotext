@@ -431,6 +431,113 @@ function cacheTranscript(cacheKey, text) {
   }, 5000);
 }
 
+// ── Cross-Source Echo Detection ──────────────────────────────────────────────
+//
+// When the user is on speakers (no headphones) the mic captures the system
+// audio that was played back through them, so the same Meet / YouTube speech
+// is transcribed twice — once via the SYSTEM pipeline (direct from
+// getDisplayMedia) and once via the MIC pipeline (acoustic echo). The two
+// pipelines are otherwise independent; this module is the only point where
+// they coordinate, by treating SYSTEM as authoritative for any content that
+// appears in both within a short time window.
+
+const RECENT_SYSTEM_WINDOW_MS = 15000;
+const recentSystemFlushes = new Map(); // session_id → [{ text, ts }]
+const TAGGED_LINE_RE = /^\[(MIC|SYSTEM)\] \[([0-9:]+)\] (.*)$/;
+
+function tokenizeForEcho(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+// Two transcripts are "echoes" of each other if their token sets overlap
+// strongly OR one is a substring of the other (mic echo is often a partial
+// capture of the cleaner system text).
+function isEchoMatch(a, b) {
+  const ta = tokenizeForEcho(a);
+  const tb = tokenizeForEcho(b);
+  if (ta.length < 2 || tb.length < 2) return false;
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  let inter = 0;
+  for (const x of setA) if (setB.has(x)) inter++;
+  const union = setA.size + setB.size - inter;
+  const j = union === 0 ? 0 : inter / union;
+  if (j >= 0.6) return true;
+  const sa = ta.join(" ");
+  const sb = tb.join(" ");
+  if (sa.length >= 8 && sb.length >= 8 && (sa.includes(sb) || sb.includes(sa))) {
+    return true;
+  }
+  return false;
+}
+
+function recordSystemFlush(session_id, text, ts) {
+  if (!text) return;
+  const arr = recentSystemFlushes.get(session_id) || [];
+  arr.push({ text, ts });
+  while (arr.length > 0 && ts - arr[0].ts > RECENT_SYSTEM_WINDOW_MS) arr.shift();
+  while (arr.length > 30) arr.shift();
+  recentSystemFlushes.set(session_id, arr);
+}
+
+function micEchoesRecentSystem(session_id, micText) {
+  const arr = recentSystemFlushes.get(session_id);
+  if (!arr || arr.length === 0) return false;
+  const now = Date.now();
+  // Prune in-place so the window stays tight.
+  while (arr.length > 0 && now - arr[0].ts > RECENT_SYSTEM_WINDOW_MS) arr.shift();
+  for (const entry of arr) {
+    if (isEchoMatch(micText, entry.text)) return true;
+  }
+  return false;
+}
+
+// Scan only the last 8 lines of the persisted transcript and remove any
+// MIC entries that are echoes of the new SYSTEM text. Returns the
+// removed entries so the frontend can drop them from its already-
+// rendered live transcript.
+async function stripEchoedMicLines(session_id, systemText) {
+  if (!systemText) return [];
+  const session = await Session.findOne({ session_id });
+  if (!session || !session.text) return [];
+
+  const lines = session.text.split("\n");
+  const scanFrom = Math.max(0, lines.length - 8);
+  const before = lines.slice(0, scanFrom);
+  const tail = lines.slice(scanFrom);
+  const keptTail = [];
+  const removed = [];
+
+  for (const line of tail) {
+    const m = TAGGED_LINE_RE.exec(line);
+    if (m && m[1] === "MIC" && isEchoMatch(m[3], systemText)) {
+      removed.push({ source: "mic", timestamp: m[2], text: m[3] });
+      continue;
+    }
+    keptTail.push(line);
+  }
+
+  if (removed.length > 0) {
+    try {
+      await Session.findOneAndUpdate(
+        { session_id },
+        { text: [...before, ...keptTail].join("\n") }
+      );
+      console.log(
+        `[${session_id}] stripped ${removed.length} echoed mic line(s) from DB`
+      );
+    } catch (err) {
+      console.error("strip-echo persist error:", err.message);
+    }
+  }
+
+  return removed;
+}
+
 // ── Buffer Flush ──────────────────────────────────────────────────────────────
 
 async function flushBuffer(bufferKey, session_id, source) {
@@ -453,6 +560,20 @@ async function flushBuffer(bufferKey, session_id, source) {
 
   const context = getTranslationContext(session_id);
   const translated = await translateWithContext(rawText, context);
+
+  // Cross-source echo guard — drop a MIC flush whose translated text is
+  // already in the recent SYSTEM window. This is the speakers-echo case:
+  // a remote Meet participant spoke, the user's mic picked it up via
+  // the speakers, and Whisper transcribed it on the mic side too.
+  // Without this guard the same speech would appear twice in the
+  // transcript (once as [MIC], once as [SYSTEM]).
+  if (source === "mic" && micEchoesRecentSystem(session_id, translated)) {
+    console.log(
+      `[${session_id}] dropped mic echo of recent system: "${translated}"`
+    );
+    return;
+  }
+
   pushTranslationContext(session_id, translated);
 
   console.log(`[${session_id}][${source}] flushed: "${rawText}" → "${translated}"`);
@@ -471,8 +592,21 @@ async function flushBuffer(bufferKey, session_id, source) {
     console.error("DB persist error:", err.message);
   }
 
+  // Post-correction: when SYSTEM flushes, scan the recent persisted
+  // tail and strip any MIC echoes that already made it through (this
+  // happens when the MIC chunk flushed before the SYSTEM chunk
+  // covering the same speech). The list of removed entries flows back
+  // to the client as `supersedes` so it can remove them from the live
+  // transcript view.
+  let supersedes = null;
+  if (source === "system") {
+    recordSystemFlush(session_id, translated, Date.now());
+    const removed = await stripEchoedMicLines(session_id, translated);
+    if (removed.length > 0) supersedes = removed;
+  }
+
   buf.flushedResults = buf.flushedResults || [];
-  buf.flushedResults.push({ text: translated, timestamp, raw: rawText });
+  buf.flushedResults.push({ text: translated, timestamp, raw: rawText, supersedes });
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -618,7 +752,16 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
     const results = buf.flushedResults.splice(0);
     if (results.length > 0) {
       const last = results[results.length - 1];
-      return res.json({ text: last.text, timestamp: last.timestamp });
+      // Aggregate supersedes across every flushed result in this batch
+      // so the client can drop any mic echoes that were already
+      // rendered before the corresponding system flush arrived.
+      const supersedes = results
+        .map((r) => r.supersedes)
+        .filter(Boolean)
+        .flat();
+      const payload = { text: last.text, timestamp: last.timestamp };
+      if (supersedes.length > 0) payload.supersedes = supersedes;
+      return res.json(payload);
     }
 
     return res.json({ text: "", buffering: true });
@@ -658,6 +801,7 @@ app.post("/start-session", protect, async (req, res) => {
       if (key.startsWith(session_id + ":")) transcriptBuffers.delete(key);
     }
     translationContext.delete(session_id);
+    recentSystemFlushes.delete(session_id);
     res.json({ success: true, session_id });
   } catch (err) {
     res.status(500).json({ error: err.message });
