@@ -204,49 +204,81 @@ function App() {
     }
 
     const rec = new SpeechRecognition();
-    rec.continuous = false;
-    rec.interimResults = false;
+    // Continuous mode keeps the recognizer alive across pauses so long
+    // sentences and back-to-back speech are not truncated.
+    rec.continuous = true;
+    // Interim results keep the audio session active and let the engine
+    // accumulate context for longer utterances before finalizing them.
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
     rec.lang = inputLangRef.current;
 
+    // Track which final result indices we've already persisted so that
+    // repeated onresult events (which re-deliver the cumulative results
+    // array) don't cause duplicates.
+    const processedFinals = new Set();
+    // When stopSession aborts the recognizer, we don't want onend to
+    // resurrect it; this flag, together with isRunningRef, guards that.
+    let aborted = false;
+
     rec.onresult = async (e) => {
-      const transcript = Array.from(e.results)
-        .filter((r) => r.isFinal)
-        .map((r) => r[0].transcript)
-        .join(" ")
-        .trim();
+      // Only look at results new/changed since the last event.
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const result = e.results[i];
+        if (!result.isFinal) continue;
+        if (processedFinals.has(i)) continue;
+        processedFinals.add(i);
 
-      if (!transcript) return;
+        const transcript = (result[0]?.transcript || "").trim();
+        if (!transcript) continue;
 
-      const english = await translateToEnglish(
-        transcript,
-        inputLangRef.current,
-      );
+        const english = await translateToEnglish(
+          transcript,
+          inputLangRef.current,
+        );
 
-      const timestamp = formatTime(new Date());
+        const timestamp = formatTime(new Date());
 
-      setLines((prev) => [
-        ...prev,
-        { source: "mic", text: english, timestamp },
-      ]);
+        setLines((prev) => [
+          ...prev,
+          { source: "mic", text: english, timestamp },
+        ]);
 
-      try {
-        await axios.post(`${API}/push`, {
-          session_id: sid,
-          text: `[MIC] [${timestamp}] ${english}`,
-        });
-      } catch {}
+        try {
+          await axios.post(`${API}/push`, {
+            session_id: sid,
+            text: `[MIC] [${timestamp}] ${english}`,
+          });
+        } catch {}
+      }
     };
 
     rec.onerror = (e) => {
-      if (e.error === "not-allowed") {
+      // Only fatal errors should tear the session down. Recoverable
+      // errors (no-speech, audio-capture, network, aborted) fall through
+      // to onend which immediately re-starts the recognizer.
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        aborted = true;
         setErrorMsg("Mic permission denied.");
         stopSession();
       }
     };
 
     rec.onend = () => {
-      if (isRunningRef.current && sessionIdRef.current === sid) {
-        setTimeout(() => startMicRecognition(sid), 200);
+      // If the user is still in an active session, restart immediately
+      // to keep capture continuous. A very small delay avoids Chrome's
+      // "InvalidStateError" when start() is called too soon after end.
+      if (
+        !aborted &&
+        isRunningRef.current &&
+        sessionIdRef.current === sid &&
+        recognitionRef.current === rec
+      ) {
+        setTimeout(() => {
+          if (isRunningRef.current && sessionIdRef.current === sid) {
+            startMicRecognition(sid);
+          }
+        }, 50);
       }
     };
 
@@ -254,7 +286,13 @@ function App() {
       rec.start();
       recognitionRef.current = rec;
     } catch {
-      setTimeout(() => startMicRecognition(sid), 500);
+      // start() can throw if the previous instance hasn't fully ended
+      // yet; retry shortly while the session is still active.
+      setTimeout(() => {
+        if (isRunningRef.current && sessionIdRef.current === sid) {
+          startMicRecognition(sid);
+        }
+      }, 250);
     }
   };
 
