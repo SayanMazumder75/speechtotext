@@ -106,7 +106,8 @@ function getNextGroqKey() {
 
 // ── Whisper ───────────────────────────────────────────────────────────────────
 
-async function callGroqWhisper(audioBuffer, mimeType) {
+async function callGroqWhisper(audioBuffer, mimeType, opts = {}) {
+  const { language, prompt } = opts;
   const maxRetries = groqApiKeys.length;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const apiKey = getNextGroqKey();
@@ -128,6 +129,16 @@ async function callGroqWhisper(audioBuffer, mimeType) {
       // audio. Sampling at higher temperatures is what produces the
       // creative "thanks for watching, see you next time" tails.
       formData.append("temperature", "0");
+      // Pinning the language activates the matching Whisper decoder
+      // (en for Indian English, hi for Hindi, bn for Bengali). This is
+      // the largest single accuracy win for Indian speakers because it
+      // stops Whisper guessing the locale on every chunk and prevents
+      // it from falling back to phonetic English transcription on
+      // Hindi / Bengali audio.
+      if (language) formData.append("language", language);
+      // A short, content-free prompt biases Whisper's vocabulary and
+      // punctuation style without seeding hallucinated continuations.
+      if (prompt) formData.append("prompt", prompt);
 
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
@@ -164,6 +175,28 @@ async function callGroqWhisper(audioBuffer, mimeType) {
   }
   return { text: "", noSpeechProb: 1, avgLogprob: -10, compressionRatio: 0 };
 }
+
+// Map UI BCP-47 language tags (en-IN, hi-IN, bn-IN) to the ISO-639-1
+// codes Whisper expects. Returns null for unknown values so we fall
+// back to Whisper's auto-detect.
+function uiLangToWhisperLang(uiLang) {
+  if (!uiLang || typeof uiLang !== "string") return null;
+  const lower = uiLang.toLowerCase();
+  if (lower.startsWith("en")) return "en";
+  if (lower.startsWith("hi")) return "hi";
+  if (lower.startsWith("bn")) return "bn";
+  return null;
+}
+
+// Style/vocabulary biasing prompt for the mic path. Kept short and
+// content-free so Whisper does not "continue" it as a hallucination on
+// silent chunks. Names are listed only as vocabulary cues — the model
+// uses them to bias spelling, not to insert them.
+const MIC_BIAS_PROMPT_BY_LANG = {
+  en: "Indian English meeting. Names like Aarav, Priya, Rahul, Ananya. Use proper punctuation.",
+  hi: "हिंदी की मीटिंग। उचित विराम चिह्नों का प्रयोग करें।",
+  bn: "বাংলা মিটিং। যথাযথ যতিচিহ্ন ব্যবহার করুন।",
+};
 
 // ── Hallucination Filter ──────────────────────────────────────────────────────
 //
@@ -481,7 +514,24 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
       return res.json({ text: "", silent: true });
     }
 
-    const whisper = await callGroqWhisper(req.file.buffer, req.file.mimetype);
+    // Language hint and biasing prompt are applied only to the mic path
+    // because:
+    //   - the UI's language picker is labeled "Mic audio language";
+    //   - system audio is meeting/video content whose language is not
+    //     known up-front, so we let Whisper auto-detect it.
+    let whisperLanguage = null;
+    let whisperPrompt = null;
+    if (source === "mic") {
+      whisperLanguage = uiLangToWhisperLang(req.body.language);
+      if (whisperLanguage && MIC_BIAS_PROMPT_BY_LANG[whisperLanguage]) {
+        whisperPrompt = MIC_BIAS_PROMPT_BY_LANG[whisperLanguage];
+      }
+    }
+
+    const whisper = await callGroqWhisper(req.file.buffer, req.file.mimetype, {
+      language: whisperLanguage,
+      prompt: whisperPrompt,
+    });
     const original = whisper.text;
     if (!original) return res.json({ text: "" });
 

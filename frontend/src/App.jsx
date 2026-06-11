@@ -18,8 +18,6 @@ import InsightsPanel from "./InsightsPanel";
 import "./index.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
-const SpeechRecognition =
-  window.SpeechRecognition || window.webkitSpeechRecognition;
 
 function App() {
   const [lines, setLines] = useState([]);
@@ -51,8 +49,6 @@ function App() {
   const inputLangRef = useRef("bn-IN");
   const sessionStartAtRef = useRef(0);
 
-  const recognitionRef = useRef(null);
-
   const systemMediaRecorderRef = useRef(null);
   const systemChunksRef = useRef([]);
   const displayStreamRef = useRef(null);
@@ -60,6 +56,15 @@ function App() {
   // measures speech presence on the system-audio stream. Called when
   // stopSession runs so we don't leak an AudioContext per session.
   const vadCleanupRef = useRef(null);
+
+  // Whisper-based microphone capture state. The mic transcription path
+  // was switched from the Web Speech API (Chrome-only, weak Indian
+  // accent support) to Groq Whisper-large-v3 via the existing
+  // /transcribe endpoint; these refs hold the recorder, mic stream and
+  // a single cleanup function for the analyser/audio-context.
+  const micWhisperRecorderRef = useRef(null);
+  const micWhisperStreamRef = useRef(null);
+  const micWhisperCleanupRef = useRef(null);
 
   const captureModeLabel = !isRunning
     ? "Idle"
@@ -151,28 +156,6 @@ function App() {
     return () => clearInterval(timer);
   }, [isRunning]);
 
-  const translateToEnglish = async (text, sourceLang) => {
-    if (!text) return "";
-
-    if (sourceLang.startsWith("en")) return text;
-
-    try {
-      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(
-        text,
-      )}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      return (
-        data[0]
-          .map((c) => c[0])
-          .join(" ")
-          .trim() || text
-      );
-    } catch {
-      return text;
-    }
-  };
-
   const sendAudioChunk = async (blob, sid, vadStats = {}) => {
     if (!blob || blob.size < 1000 || !sid) return;
     try {
@@ -210,103 +193,198 @@ function App() {
     }
   };
 
-  const startMicRecognition = (sid) => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome — Web Speech API not supported.");
+  // Send a microphone audio chunk to the Whisper-backed /transcribe
+  // endpoint. Mirrors sendAudioChunk but tags source=mic and forwards
+  // the user-selected language so the server can run the matching
+  // Whisper decoder (en for Indian English, hi for Hindi, bn for
+  // Bengali). On success the returned final text is appended to the
+  // mic stream of the live transcript exactly like the previous Web
+  // Speech path did.
+  const sendMicChunk = async (blob, sid, vadStats = {}) => {
+    if (!blob || blob.size < 1000 || !sid) return;
+    try {
+      const formData = new FormData();
+      formData.append("audio", blob, "mic.webm");
+      formData.append("session_id", sid);
+      formData.append("source", "mic");
+      formData.append("language", inputLangRef.current);
+      if (Number.isFinite(vadStats.speechRatio)) {
+        formData.append("speechRatio", String(vadStats.speechRatio));
+      }
+      if (Number.isFinite(vadStats.peakRms)) {
+        formData.append("peakRms", String(vadStats.peakRms));
+      }
+
+      const res = await axios.post(`${API}/transcribe`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+
+      if (res.data.text) {
+        setLines((prev) => [
+          ...prev,
+          {
+            source: "mic",
+            text: res.data.text,
+            timestamp: res.data.timestamp || formatTime(new Date()),
+          },
+        ]);
+      }
+    } catch (err) {
+      console.error("Mic transcribe error:", err);
+    }
+  };
+
+  // Capture the microphone in 4-second chunks and send each chunk to
+  // Groq Whisper-large-v3 via /transcribe. Replaces the previous Web
+  // Speech API mic path. Whisper-large-v3 has substantially lower WER
+  // on Indian English / Hindi-accented English / Bengali-accented
+  // English than Chrome's webkitSpeechRecognition endpoint, accepts a
+  // language hint (so a Hindi / Bengali speaker is decoded with the
+  // right model), accepts a vocabulary biasing prompt, and works in
+  // every modern browser instead of Chromium-only.
+  const startMicWhisperRecorder = async (sid) => {
+    let micStream;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        // Browser-side cleanup helps Whisper transcribe cheap headset
+        // mics that Indian remote workers commonly use.
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+    } catch (err) {
+      console.error("Mic getUserMedia failed:", err);
+      setErrorMsg("Mic permission denied or unavailable.");
       return;
     }
 
-    const rec = new SpeechRecognition();
-    // Continuous mode keeps the recognizer alive across pauses so long
-    // sentences and back-to-back speech are not truncated.
-    rec.continuous = true;
-    // Interim results keep the audio session active and let the engine
-    // accumulate context for longer utterances before finalizing them.
-    rec.interimResults = true;
-    rec.maxAlternatives = 1;
-    rec.lang = inputLangRef.current;
+    micWhisperStreamRef.current = micStream;
 
-    // Track which final result indices we've already persisted so that
-    // repeated onresult events (which re-deliver the cumulative results
-    // array) don't cause duplicates.
-    const processedFinals = new Set();
-    // When stopSession aborts the recognizer, we don't want onend to
-    // resurrect it; this flag, together with isRunningRef, guards that.
-    let aborted = false;
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "audio/mp4";
 
-    rec.onresult = async (e) => {
-      // Only look at results new/changed since the last event.
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const result = e.results[i];
-        if (!result.isFinal) continue;
-        if (processedFinals.has(i)) continue;
-        processedFinals.add(i);
+    // Per-window VAD identical to the system-audio path. Skips silent
+    // chunks locally and forwards speechRatio/peakRms so the server's
+    // hallucination filter knows when to be aggressive.
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const vadCtx = new AudioCtx();
+    const vadSource = vadCtx.createMediaStreamSource(micStream);
+    const analyser = vadCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0;
+    vadSource.connect(analyser);
+    const vadBuffer = new Float32Array(analyser.fftSize);
+    const SPEECH_RMS_THRESHOLD = 0.012;
 
-        const transcript = (result[0]?.transcript || "").trim();
-        if (!transcript) continue;
+    let speechFrames = 0;
+    let totalFrames = 0;
+    let peakRms = 0;
+    let vadInterval = null;
 
-        const english = await translateToEnglish(
-          transcript,
-          inputLangRef.current,
-        );
+    const stopVadInterval = () => {
+      if (vadInterval) {
+        clearInterval(vadInterval);
+        vadInterval = null;
+      }
+    };
 
-        const timestamp = formatTime(new Date());
+    const startVadWindow = () => {
+      speechFrames = 0;
+      totalFrames = 0;
+      peakRms = 0;
+      stopVadInterval();
+      vadInterval = setInterval(() => {
+        analyser.getFloatTimeDomainData(vadBuffer);
+        let sumSq = 0;
+        for (let i = 0; i < vadBuffer.length; i++) {
+          sumSq += vadBuffer[i] * vadBuffer[i];
+        }
+        const rms = Math.sqrt(sumSq / vadBuffer.length);
+        if (rms > peakRms) peakRms = rms;
+        if (rms > SPEECH_RMS_THRESHOLD) speechFrames++;
+        totalFrames++;
+      }, 50);
+    };
 
-        setLines((prev) => [
-          ...prev,
-          { source: "mic", text: english, timestamp },
-        ]);
+    micWhisperCleanupRef.current = () => {
+      stopVadInterval();
+      try { vadSource.disconnect(); } catch { /* already disconnected */ }
+      try { analyser.disconnect(); } catch { /* already disconnected */ }
+      try { vadCtx.close(); } catch { /* already closed */ }
+      try { micStream.getTracks().forEach((t) => t.stop()); } catch { /* tracks already stopped */ }
+      micWhisperStreamRef.current = null;
+    };
 
-        try {
-          await axios.post(`${API}/push`, {
-            session_id: sid,
-            text: `[MIC] [${timestamp}] ${english}`,
+    let chunks = [];
+    const recorder = new MediaRecorder(micStream, { mimeType });
+    micWhisperRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (e) => {
+      if (e.data?.size > 0) chunks.push(e.data);
+    };
+
+    recorder.onstop = async () => {
+      stopVadInterval();
+      const speechRatio = totalFrames > 0 ? speechFrames / totalFrames : 0;
+      const chunkPeakRms = peakRms;
+
+      if (chunks.length > 0) {
+        const blob = new Blob(chunks, { type: mimeType });
+        chunks = [];
+        const isSilent = speechRatio < 0.03 && chunkPeakRms < 0.01;
+        if (!isSilent) {
+          await sendMicChunk(blob, sid, {
+            speechRatio,
+            peakRms: chunkPeakRms,
           });
-        } catch {}
+        }
+      } else {
+        chunks = [];
       }
-    };
 
-    rec.onerror = (e) => {
-      // Only fatal errors should tear the session down. Recoverable
-      // errors (no-speech, audio-capture, network, aborted) fall through
-      // to onend which immediately re-starts the recognizer.
-      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-        aborted = true;
-        setErrorMsg("Mic permission denied.");
-        stopSession();
-      }
-    };
-
-    rec.onend = () => {
-      // If the user is still in an active session, restart immediately
-      // to keep capture continuous. A very small delay avoids Chrome's
-      // "InvalidStateError" when start() is called too soon after end.
+      // Restart for the next window only while the session is still
+      // active and we still own the recorder.
       if (
-        !aborted &&
         isRunningRef.current &&
         sessionIdRef.current === sid &&
-        recognitionRef.current === rec
+        micWhisperRecorderRef.current === recorder
       ) {
+        startVadWindow();
+        try {
+          recorder.start();
+        } catch {
+          // Browser will throw if start() is called before the previous
+          // stop() has fully landed; the next event-loop tick is enough.
+          setTimeout(() => {
+            if (
+              isRunningRef.current &&
+              sessionIdRef.current === sid &&
+              micWhisperRecorderRef.current === recorder
+            ) {
+              try { recorder.start(); } catch {}
+            }
+          }, 50);
+        }
         setTimeout(() => {
-          if (isRunningRef.current && sessionIdRef.current === sid) {
-            startMicRecognition(sid);
-          }
-        }, 50);
+          if (recorder.state === "recording") recorder.stop();
+        }, 4000);
+      } else if (micWhisperCleanupRef.current) {
+        micWhisperCleanupRef.current();
+        micWhisperCleanupRef.current = null;
+        micWhisperRecorderRef.current = null;
       }
     };
 
-    try {
-      rec.start();
-      recognitionRef.current = rec;
-    } catch {
-      // start() can throw if the previous instance hasn't fully ended
-      // yet; retry shortly while the session is still active.
-      setTimeout(() => {
-        if (isRunningRef.current && sessionIdRef.current === sid) {
-          startMicRecognition(sid);
-        }
-      }, 250);
-    }
+    startVadWindow();
+    recorder.start();
+    setTimeout(() => {
+      if (recorder.state === "recording") recorder.stop();
+    }, 4000);
   };
 
   const startSystemAudio = (sid, displayStream) => {
@@ -585,8 +663,8 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
   };
 
   const startSession = async () => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome on desktop.");
+    if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setErrorMsg("This browser does not support microphone capture.");
       return;
     }
 
@@ -612,7 +690,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       setIsRunning(true);
       setAudioSources(["mic"]);
 
-      startMicRecognition(newSessionId);
+      startMicWhisperRecorder(newSessionId);
 
       // Try to get system audio first, then start recording
       try {
@@ -664,11 +742,19 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     isRunningRef.current = false;
     sessionIdRef.current = "";
 
-    if (recognitionRef.current) {
+    // Stop the Whisper-based mic recorder, if running, and release the
+    // mic stream + analyser/audio-context it owns.
+    if (micWhisperRecorderRef.current) {
       try {
-        recognitionRef.current.abort();
+        if (micWhisperRecorderRef.current.state === "recording") {
+          micWhisperRecorderRef.current.stop();
+        }
       } catch {}
-      recognitionRef.current = null;
+      micWhisperRecorderRef.current = null;
+    }
+    if (micWhisperCleanupRef.current) {
+      micWhisperCleanupRef.current();
+      micWhisperCleanupRef.current = null;
     }
 
     if (systemMediaRecorderRef.current?.state === "recording") {
