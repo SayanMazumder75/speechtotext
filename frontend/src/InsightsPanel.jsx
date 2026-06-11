@@ -1,4 +1,5 @@
 import { useState } from "react";
+import axios from "axios";
 import {
   Brain,
   ListChecks,
@@ -12,7 +13,7 @@ import {
   Check,
   X,
   RotateCcw,
-  Loader2,
+  Loader2
 } from "lucide-react";
 import { getToken } from "./auth";
 
@@ -28,17 +29,10 @@ function Section({ icon: Icon, title, color, children, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <div className="insights-section" style={{ "--accent": color }}>
-      <button
-        className="insights-section-header"
-        onClick={() => setOpen(!open)}
-      >
+      <button className="insights-section-header" onClick={() => setOpen(!open)}>
         <Icon size={16} style={{ color }} />
         <span style={{ color }}>{title}</span>
-        {open ? (
-          <ChevronUp size={14} style={{ marginLeft: "auto", opacity: 0.5 }} />
-        ) : (
-          <ChevronDown size={14} style={{ marginLeft: "auto", opacity: 0.5 }} />
-        )}
+        {open ? <ChevronUp size={14} style={{ marginLeft: "auto", opacity: 0.5 }} /> : <ChevronDown size={14} style={{ marginLeft: "auto", opacity: 0.5 }} />}
       </button>
       {open && <div className="insights-section-body">{children}</div>}
     </div>
@@ -47,12 +41,10 @@ function Section({ icon: Icon, title, color, children, defaultOpen = false }) {
 
 function QuizCard({ q, idx }) {
   const [selected, setSelected] = useState(null);
-  const correct = q.options.findIndex((o) => o === q.answer);
+  const correct = q.options.findIndex(o => o === q.answer);
   return (
     <div className="quiz-card">
-      <p className="quiz-question">
-        <span className="quiz-num">Q{idx + 1}.</span> {q.question}
-      </p>
+      <p className="quiz-question"><span className="quiz-num">Q{idx + 1}.</span> {q.question}</p>
       <div className="quiz-options">
         {q.options.map((opt, i) => {
           let cls = "quiz-option";
@@ -68,21 +60,15 @@ function QuizCard({ q, idx }) {
               disabled={selected !== null}
             >
               {selected !== null && i === correct && <Check size={13} />}
-              {selected !== null && i === selected && i !== correct && (
-                <X size={13} />
-              )}
+              {selected !== null && i === selected && i !== correct && <X size={13} />}
               {opt}
             </button>
           );
         })}
       </div>
       {selected !== null && (
-        <div
-          className={`quiz-result ${selected === correct ? "pass" : "fail"}`}
-        >
-          {selected === correct
-            ? "✓ Correct!"
-            : `✗ Correct answer: ${q.answer}`}
+        <div className={`quiz-result ${selected === correct ? "pass" : "fail"}`}>
+          {selected === correct ? "✓ Correct!" : `✗ Correct answer: ${q.answer}`}
         </div>
       )}
     </div>
@@ -96,10 +82,7 @@ function FlashcardDeck({ cards }) {
   const card = cards[idx];
   return (
     <div className="flashcard-wrap">
-      <div
-        className={`flashcard ${flipped ? "flipped" : ""}`}
-        onClick={() => setFlipped(!flipped)}
-      >
+      <div className={`flashcard ${flipped ? "flipped" : ""}`} onClick={() => setFlipped(!flipped)}>
         <div className="flashcard-front">
           <span className="fc-label">TERM</span>
           <p>{card.front}</p>
@@ -111,52 +94,24 @@ function FlashcardDeck({ cards }) {
         </div>
       </div>
       <div className="fc-controls">
-        <button
-          onClick={() => {
-            setIdx((idx - 1 + cards.length) % cards.length);
-            setFlipped(false);
-          }}
-          className="fc-btn"
-        >
-          ← Prev
-        </button>
-        <span className="fc-count">
-          {idx + 1} / {cards.length}
-        </span>
-        <button
-          onClick={() => {
-            setIdx((idx + 1) % cards.length);
-            setFlipped(false);
-          }}
-          className="fc-btn"
-        >
-          Next →
-        </button>
+        <button onClick={() => { setIdx((idx - 1 + cards.length) % cards.length); setFlipped(false); }} className="fc-btn">← Prev</button>
+        <span className="fc-count">{idx + 1} / {cards.length}</span>
+        <button onClick={() => { setIdx((idx + 1) % cards.length); setFlipped(false); }} className="fc-btn">Next →</button>
       </div>
     </div>
   );
 }
 
-export default function InsightsPanel({
-  lines,
-  darkMode,
-  insights,
-  setInsights,
-}) {
+export default function InsightsPanel({ lines, darkMode, insights, setInsights }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [vault, setVault] = useState([]);
   const [saved, setSaved] = useState(false);
 
-  const transcriptText = lines
-    .map((l) => `[${l.source.toUpperCase()}] ${l.text}`)
-    .join("\n");
+  const transcriptText = lines.map(l => `[${l.source.toUpperCase()}] ${l.text}`).join("\n");
 
   const generate = async () => {
-    if (!transcriptText.trim()) {
-      setError("No transcript yet. Start session first.");
-      return;
-    }
+    if (!transcriptText.trim()) { setError("No transcript yet. Start session first."); return; }
     setLoading(true);
     setError("");
     setInsights(null);
@@ -189,11 +144,13 @@ Return this exact JSON shape:
 
 Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensure quiz options array has exactly 4 items and answer matches one option exactly.`;
 
-      const res = await axios.post(`${API}/ai-insights`, { prompt });
-      setInsights(res.data);
-    } catch (err) {
-      setErrorMsg("Failed to regenerate insights.");
-      console.error(err);
+      const data = await callClaude(prompt);
+      setInsights(data);
+    } catch (e) {
+      setError("AI generation failed. Check API or transcript length.");
+      console.error(e);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -203,9 +160,9 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       id: Date.now(),
       savedAt: new Date().toLocaleString(),
       lineCount: lines.length,
-      ...insights,
+      ...insights
     };
-    setVault((prev) => [entry, ...prev]);
+    setVault(prev => [entry, ...prev]);
     setSaved(true);
   };
 
@@ -223,11 +180,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           onClick={generate}
           disabled={loading}
         >
-          {loading ? (
-            <Loader2 size={16} className="spin" />
-          ) : (
-            <Sparkles size={16} />
-          )}
+          {loading ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}
           {loading ? "Analyzing..." : "Generate AI Insights"}
         </button>
       </div>
@@ -237,10 +190,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       {!insights && !loading && (
         <div className="insights-empty">
           <Brain size={40} style={{ opacity: 0.2, marginBottom: 12 }} />
-          <p>
-            Click <strong>Generate AI Insights</strong> after recording to
-            unlock summary, key points, action items, flashcards, and quiz.
-          </p>
+          <p>Click <strong>Generate AI Insights</strong> after recording to unlock summary, key points, action items, flashcards, and quiz.</p>
         </div>
       )}
 
@@ -270,14 +220,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
                 <div key={i} className="action-card">
                   <div className="action-top">
                     <span className="action-task">{a.task}</span>
-                    <span
-                      className="priority-badge"
-                      style={{
-                        background: priorityColor[a.priority] + "22",
-                        color: priorityColor[a.priority],
-                        border: `1px solid ${priorityColor[a.priority]}44`,
-                      }}
-                    >
+                    <span className="priority-badge" style={{ background: priorityColor[a.priority] + "22", color: priorityColor[a.priority], border: `1px solid ${priorityColor[a.priority]}44` }}>
                       {a.priority}
                     </span>
                   </div>
@@ -304,26 +247,12 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           {/* Save to Vault */}
           <Section icon={Archive} title="Study Vault" color="#06b6d4">
             <div className="vault-save-row">
-              <button
-                className={`vault-btn ${saved ? "saved" : ""}`}
-                onClick={saveToVault}
-                disabled={saved}
-              >
-                {saved ? (
-                  <>
-                    <Check size={14} /> Saved to Vault
-                  </>
-                ) : (
-                  <>
-                    <Archive size={14} /> Save Current Insights
-                  </>
-                )}
+              <button className={`vault-btn ${saved ? "saved" : ""}`} onClick={saveToVault} disabled={saved}>
+                {saved ? <><Check size={14} /> Saved to Vault</> : <><Archive size={14} /> Save Current Insights</>}
               </button>
             </div>
-            {vault.length === 0 && (
-              <p className="vault-empty">No saved sessions yet.</p>
-            )}
-            {vault.map((v) => (
+            {vault.length === 0 && <p className="vault-empty">No saved sessions yet.</p>}
+            {vault.map(v => (
               <div key={v.id} className="vault-card">
                 <div className="vault-card-header">
                   <span className="vault-date">{v.savedAt}</span>
@@ -331,14 +260,9 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
                 </div>
                 <p className="vault-summary">{v.summary}</p>
                 <details className="vault-details">
-                  <summary>
-                    {v.keyPoints?.length} key points · {v.actionItems?.length}{" "}
-                    actions · {v.flashcards?.length} flashcards
-                  </summary>
+                  <summary>{v.keyPoints?.length} key points · {v.actionItems?.length} actions · {v.flashcards?.length} flashcards</summary>
                   <ul className="vault-kp">
-                    {v.keyPoints?.map((p, i) => (
-                      <li key={i}>{p}</li>
-                    ))}
+                    {v.keyPoints?.map((p, i) => <li key={i}>{p}</li>)}
                   </ul>
                 </details>
               </div>
