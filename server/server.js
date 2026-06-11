@@ -361,13 +361,18 @@ async function translateWithContext(text, contextChunks) {
           temperature: 0.1,
           messages: [{
             role: "user",
-            content: `You are a live meeting translator. Translate the NEW TEXT to fluent English.
-Use the CONTEXT to ensure continuity and accurate terminology.
-Return ONLY the translated text, nothing else.
+            content: `You are a live meeting translator producing the final transcript line.
 
-CONTEXT (already translated): "${contextStr}"
+CONTEXT (already translated, for continuity & terminology only): "${contextStr}"
 
-NEW TEXT: "${text}"`
+NEW TEXT: "${text}"
+
+Rules:
+- Output ONE clean English sentence (or two short ones), nothing else — no preamble, no quotes, no explanations.
+- If NEW TEXT is already fluent English, return it lightly cleaned: fix obvious typos, capitalization and missing punctuation, but do NOT paraphrase.
+- If NEW TEXT is not English, translate it to natural fluent English using the CONTEXT for terminology.
+- Use proper capitalization. End with a period unless the text is clearly an unfinished fragment.
+- Do not invent content that is not in NEW TEXT.`
           }]
         })
       });
@@ -406,8 +411,13 @@ async function translateToEnglish(text) {
 const recentTranscripts = new Map();
 
 function jaccardSimilarity(a, b) {
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
+  // Normalize both texts (lowercase, strip punctuation) before
+  // comparing, so trivial differences like "Hello." vs "hello!"
+  // don't escape the duplicate detector.
+  const tokensA = tokenizeForEcho(a);
+  const tokensB = tokenizeForEcho(b);
+  const setA = new Set(tokensA);
+  const setB = new Set(tokensB);
   const intersection = [...setA].filter(x => setB.has(x)).length;
   const union = new Set([...setA, ...setB]).size;
   return union === 0 ? 0 : intersection / union;
@@ -538,9 +548,45 @@ async function stripEchoedMicLines(session_id, systemText) {
   return removed;
 }
 
+// ── Output Cleanup ────────────────────────────────────────────────────────────
+//
+// cleanupSentence applies light typographic normalization to a final
+// translated sentence before it lands in the live transcript or the
+// persisted DB:
+//   - collapse runs of whitespace,
+//   - tighten space-before-punctuation, ensure single space after,
+//   - capitalize the first Unicode letter,
+//   - optionally close with a terminal period when the speaker has
+//     stopped (idle flush) or the input already had terminal
+//     punctuation. This avoids fragments like "we should also
+//     consider the budget" with no period that read poorly in
+//     prose-mode and exports.
+function cleanupSentence(text, opts = {}) {
+  const closeWithPeriod = !!opts.closeWithPeriod;
+  if (!text) return "";
+  let s = String(text).replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  // No space before commas / periods / etc.
+  s = s.replace(/\s+([.,!?;:])/g, "$1");
+  // Single space after sentence-internal punctuation when missing.
+  s = s.replace(/([.,!?;:])([^\s.,!?;:"'\)])/g, "$1 $2");
+  // Drop dangling commas / semicolons at the end (Whisper sometimes
+  // emits these on truncated chunks). Leave terminal punctuation alone.
+  if (!/[.!?…]\s*$/.test(s)) {
+    s = s.replace(/[\s,;:]+$/, "");
+  }
+  // Capitalize the first letter (Unicode-safe).
+  s = s.replace(/^(\p{L})/u, (m) => m.toUpperCase());
+  if (closeWithPeriod && !/[.!?…]["']?$/.test(s)) {
+    s = s + ".";
+  }
+  return s;
+}
+
 // ── Buffer Flush ──────────────────────────────────────────────────────────────
 
-async function flushBuffer(bufferKey, session_id, source) {
+async function flushBuffer(bufferKey, session_id, source, opts = {}) {
+  const idleFlush = !!opts.idleFlush;
   const buf = transcriptBuffers.get(bufferKey);
   if (!buf || buf.chunks.length === 0) return;
 
@@ -559,7 +605,22 @@ async function flushBuffer(bufferKey, session_id, source) {
   cacheTranscript(cacheKey, rawText);
 
   const context = getTranslationContext(session_id);
-  const translated = await translateWithContext(rawText, context);
+  const translatedRaw = await translateWithContext(rawText, context);
+
+  // Decide whether the cleaned sentence should be closed with a
+  // terminal period. Two cases say yes:
+  //   - the chunk already ended with sentence-ending punctuation
+  //     (the speaker visibly finished a thought), or
+  //   - the buffer was flushed by the idle timer (the speaker stopped
+  //     and we have no continuation in flight).
+  // A 20-word inline flush mid-sentence stays open so the next flush
+  // can continue the thought without an artificial split-period.
+  const rawHasTerminal = /[.!?…]["']?\s*$/.test(rawText);
+  const translatedHasTerminal = /[.!?…]["']?\s*$/.test(translatedRaw || "");
+  const closeWithPeriod = idleFlush || rawHasTerminal || translatedHasTerminal;
+
+  const translated = cleanupSentence(translatedRaw, { closeWithPeriod });
+  if (!translated) return;
 
   // Cross-source echo guard — drop a MIC flush whose translated text is
   // already in the recent SYSTEM window. This is the speakers-echo case:
@@ -727,6 +788,19 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
       return res.json({ text: "" });
     }
 
+    // Hard confidence reject: Whisper's avg_logprob runs roughly
+    // [0, -1.5] in confident regions; below -1.5 the decoder is very
+    // uncertain and the output is usually garbled, mistranscribed, or
+    // a partial phonetic guess. These chunks degrade transcript
+    // quality regardless of the hallucination filter.
+    if (whisper.avgLogprob < -1.5) {
+      console.log(
+        `[${session_id}] dropped low-confidence chunk ` +
+        `(lp=${whisper.avgLogprob.toFixed(2)}): "${original}"`
+      );
+      return res.json({ text: "" });
+    }
+
     const bufferKey = `${session_id}:${source}`;
     let buf = transcriptBuffers.get(bufferKey);
     if (!buf) {
@@ -736,17 +810,25 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
 
     buf.chunks.push(original);
 
-    const shouldFlushNow =
-      SENTENCE_END_RE.test(original) ||
-      buf.chunks.join(" ").split(/\s+/).length >= 20;
+    const accumulated = buf.chunks.join(" ").trim();
+    const accumulatedWordCount = accumulated.split(/\s+/).filter(Boolean).length;
+    const hasTerminalEnd = SENTENCE_END_RE.test(original);
+    const tooLong = accumulatedWordCount >= 20;
+    const shouldFlushNow = hasTerminalEnd || tooLong;
 
     if (shouldFlushNow) {
-      await flushBuffer(bufferKey, session_id, source);
+      await flushBuffer(bufferKey, session_id, source, { idleFlush: false });
     } else {
+      // Fragment merging: a buffer with very few words and no
+      // terminal punctuation is almost certainly a sentence in
+      // progress. Wait longer (5.5s) for a likely continuation
+      // before forcing a flush; this halves the number of broken
+      // mid-sentence lines in the final transcript.
+      const idle = accumulatedWordCount < 6 ? 5500 : BUFFER_IDLE_MS;
       if (buf.timer) clearTimeout(buf.timer);
       buf.timer = setTimeout(async () => {
-        await flushBuffer(bufferKey, session_id, source);
-      }, BUFFER_IDLE_MS);
+        await flushBuffer(bufferKey, session_id, source, { idleFlush: true });
+      }, idle);
     }
 
     const results = buf.flushedResults.splice(0);
