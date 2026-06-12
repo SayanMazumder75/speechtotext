@@ -693,6 +693,134 @@ app.get("/vault/:id", protect, async (req, res) => {
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════
+// SERVER.JS — TWO SURGICAL CHANGES ONLY
+// Do NOT touch system audio path. Mic path only.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── CHANGE 1: Add cross-source duplicate cache ────────────────────
+// Place this AFTER the existing recentTranscripts Map declaration.
+// Tracks last N translated outputs per session regardless of source.
+// Used to detect when mic captures what system already transcribed.
+
+// Cross-source similarity cache: session_id → last 5 translated outputs
+const crossSourceCache = new Map();
+
+function addToCrossCache(session_id, translated) {
+  const cache = crossSourceCache.get(session_id) || [];
+  cache.push({ text: translated, time: Date.now() });
+  // Keep only last 5, max 30s old
+  const fresh = cache.filter(e => Date.now() - e.time < 30000).slice(-5);
+  crossSourceCache.set(session_id, fresh);
+}
+
+function isCrossSourceDuplicate(session_id, text) {
+  const cache = crossSourceCache.get(session_id) || [];
+  const fresh = cache.filter(e => Date.now() - e.time < 30000);
+  for (const entry of fresh) {
+    if (jaccardSimilarity(entry.text, text) > 0.70) {
+      return true; // mic picked up what system already said
+    }
+  }
+  return false;
+}
+
+
+// ── CHANGE 2: Replace flushBuffer — split mic vs system paths ─────
+// ONLY change: mic source skips LLaMA, uses Google Translate only.
+// mic also gets cross-source dedup check.
+// System path UNCHANGED.
+
+async function flushBuffer(bufferKey, session_id, source) {
+  const buf = transcriptBuffers.get(bufferKey);
+  if (!buf || buf.chunks.length === 0) return;
+
+  if (buf.timer) { clearTimeout(buf.timer); buf.timer = null; }
+
+  const rawText = buf.chunks.join(" ").trim();
+  buf.chunks = [];
+
+  if (!rawText) return;
+
+  if (isHallucination(rawText)) {
+    console.log(`[${session_id}] buffer flush hallucination rejected: "${rawText}"`);
+    return;
+  }
+
+  const cacheKey = `${session_id}:${source}`;
+  if (isDuplicate(cacheKey, rawText)) {
+    console.log(`[${session_id}] buffered duplicate skipped`);
+    return;
+  }
+  cacheTranscript(cacheKey, rawText);
+
+  let translated;
+
+  if (source === "mic") {
+    // ── MIC PATH: verbatim only ──────────────────────────────────
+    // NO LLaMA. No context injection. Google Translate only.
+    // This prevents AI from rewriting/paraphrasing what user said.
+    const hasNonLatin = /[\u0080-\uFFFF]/.test(rawText);
+    if (!hasNonLatin) {
+      // Already English — use as-is
+      translated = rawText;
+    } else {
+      // Non-English mic input — plain Google Translate, no LLaMA
+      try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(rawText)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        translated = data[0].map(c => c[0]).join(" ").trim() || rawText;
+      } catch {
+        translated = rawText;
+      }
+    }
+
+    // Cross-source dedup: reject if system already captured this
+    if (isCrossSourceDuplicate(session_id, translated)) {
+      console.log(`[${session_id}][mic] cross-source duplicate rejected: "${translated}"`);
+      return;
+    }
+
+  } else {
+    // ── SYSTEM PATH: unchanged — context-aware LLaMA translation ──
+    const context = getTranslationContext(session_id);
+    translated = await translateWithContext(rawText, context);
+    pushTranslationContext(session_id, translated);
+
+    // Post-translate hallucination check (system only)
+    const translatedLower = translated.toLowerCase().trim();
+    const SHORT_TRANSLATED_NOISE = new Set([
+      "we ourselves", "ourselves", "we", "they themselves",
+      "she herself", "he himself", "yourself", "itself",
+    ]);
+    if (SHORT_TRANSLATED_NOISE.has(translatedLower)) {
+      console.log(`[${session_id}] translated hallucination rejected: "${rawText}" → "${translated}"`);
+      return;
+    }
+
+    // Add system output to cross-source cache so mic dedup can use it
+    addToCrossCache(session_id, translated);
+  }
+
+  console.log(`[${session_id}][${source}] flushed: "${rawText}" → "${translated}"`);
+
+  const timestamp = formatTimestamp();
+  const tagged = `[${(source || "system").toUpperCase()}] [${timestamp}] ${translated}`;
+  try {
+    const session = await Session.findOne({ session_id });
+    if (session) {
+      await Session.findOneAndUpdate({ session_id }, { text: session.text + tagged + "\n" });
+    }
+  } catch (err) {
+    console.error("DB persist error:", err.message);
+  }
+
+  buf.flushedResults = buf.flushedResults || [];
+  buf.flushedResults.push({ text: translated, timestamp, raw: rawText });
+}
+
 app.get("/", (req, res) => res.json({ status: "ok", service: "AI Meeting Intelligence" }));
 
 const PORT = process.env.PORT || 5000;
