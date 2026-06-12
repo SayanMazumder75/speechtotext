@@ -85,7 +85,6 @@ function App() {
 
   // System audio refs
   const systemMediaRecorderRef = useRef(null);
-  const systemChunksRef = useRef([]);
   const displayStreamRef = useRef(null);
 
   const captureModeLabel = !isRunning
@@ -308,56 +307,84 @@ function App() {
     }
   };
 
-  // ── System audio: always-on 8s loop ──────────────────────────────────────
+  // ── System audio: continuous 10s loop with OVERLAPPING recorders ─────────
+  // Same shape as the mic PTT path (record → onstop → VAD → /transcribe),
+  // except instead of stop-on-release it auto-cycles every 10 seconds.
+  //
+  // Key property: audio capture is NEVER paused. Every 10s we spin up a
+  // fresh MediaRecorder *before* stopping the previous one. The previous
+  // recorder's onstop then fires asynchronously and ships its 10s blob to
+  // /transcribe, while the new recorder is already capturing the next 10s.
+  // Result: the user can keep talking through the upload/transcription —
+  // nothing is dropped between windows.
+  const SYSTEM_LOOP_MS = 10000;
+
   const startSystemAudio = (sid, displayStream) => {
     if (!displayStream || displayStream.getAudioTracks().length === 0) return;
 
-    systemChunksRef.current = [];
     const audioStream = new MediaStream(displayStream.getAudioTracks());
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
       : "audio/webm";
 
-    const recorder = new MediaRecorder(audioStream, { mimeType });
-    systemMediaRecorderRef.current = recorder;
+    const stillActive = () =>
+      isRunningRef.current &&
+      sessionIdRef.current === sid &&
+      displayStream.active;
 
-    recorder.ondataavailable = (e) => {
-      if (e.data?.size > 0) systemChunksRef.current.push(e.data);
-    };
+    // Build one recorder for one 10s window. Each recorder owns its OWN
+    // chunks array via closure, so two overlapping recorders never share state.
+    const buildWindowRecorder = () => {
+      const chunks = [];
+      const recorder = new MediaRecorder(audioStream, { mimeType });
 
-    recorder.onstop = async () => {
-      if (systemChunksRef.current.length > 0) {
-        const blob = new Blob(systemChunksRef.current, { type: mimeType });
-        systemChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data?.size > 0) chunks.push(e.data);
+      };
 
-        // ── CLIENT-SIDE VAD for system audio too ──────────────────────────
-        // System audio loops every 8s, so we also check RMS before sending
+      // Fires AFTER we've already started the next recorder, so this work
+      // (RMS decode + network upload) happens with no impact on capture.
+      recorder.onstop = async () => {
+        if (chunks.length === 0) return;
+        const blob = new Blob(chunks, { type: mimeType });
+
+        // Same client-side VAD used by the mic PTT path
         const rms = await getAudioRMS(blob);
         console.log(`[SYS VAD] RMS=${rms.toFixed(4)}, size=${blob.size}`);
-        if (rms >= RMS_THRESHOLD) {
-          await sendAudioChunk(blob, sid, "system");
-        } else {
-          console.log(`[SYS VAD] Silent 8s chunk skipped (RMS=${rms.toFixed(4)})`);
+        if (rms < RMS_THRESHOLD) {
+          console.log(`[SYS VAD] Silent 10s chunk skipped (RMS=${rms.toFixed(4)})`);
+          return;
         }
-      }
+        await sendAudioChunk(blob, sid, "system");
+      };
 
-      if (
-        isRunningRef.current &&
-        sessionIdRef.current === sid &&
-        displayStream.active
-      ) {
-        systemChunksRef.current = [];
-        recorder.start();
-        setTimeout(() => {
-          if (recorder.state === "recording") recorder.stop();
-        }, 8000);
-      }
+      return recorder;
     };
 
-    recorder.start();
-    setTimeout(() => {
-      if (recorder.state === "recording") recorder.stop();
-    }, 8000);
+    const cycle = () => {
+      if (!stillActive()) return;
+
+      // 1. Start the NEW recorder first → audio capture stays continuous.
+      const next = buildWindowRecorder();
+      next.start();
+
+      // 2. Stop the previous recorder → its onstop ships the just-finished
+      //    10s chunk asynchronously while `next` keeps recording.
+      const prev = systemMediaRecorderRef.current;
+      systemMediaRecorderRef.current = next;
+      if (prev && prev.state === "recording") {
+        try { prev.stop(); } catch {}
+      }
+
+      // 3. Schedule the next rollover.
+      setTimeout(cycle, SYSTEM_LOOP_MS);
+    };
+
+    // Kick the loop off with the first window.
+    const first = buildWindowRecorder();
+    systemMediaRecorderRef.current = first;
+    first.start();
+    setTimeout(cycle, SYSTEM_LOOP_MS);
   };
 
   // ── Upload all PTT blobs as one session recording ─────────────────────────
