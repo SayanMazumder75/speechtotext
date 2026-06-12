@@ -27,7 +27,6 @@ mongoose.connect(process.env.MONGO_URI)
   .catch(err => console.error("MongoDB error:", err));
 
 // ── Auth Middleware ────────────────────────────────────────────────────────────
-// Uses same JWT_SECRET as MeetMind — SSO via postMessage token hand-off
 
 const protect = (req, res, next) => {
   const header = req.headers.authorization;
@@ -51,7 +50,6 @@ const protect = (req, res, next) => {
 
 const sessionSchema = new mongoose.Schema({
   session_id: { type: String, required: true, unique: true },
-  // userId: optional for migration safety — old records won't break
   userId: { type: String, index: true },
   text: { type: String, default: "" },
   audioUrl: { type: String, default: "" },
@@ -62,7 +60,6 @@ const Session = mongoose.model("Session", sessionSchema);
 
 const vaultSchema = new mongoose.Schema({
   session_id: String,
-  // userId: optional for migration safety
   userId: { type: String, index: true },
   savedAt: { type: Date, default: Date.now },
   transcript: String,
@@ -105,8 +102,10 @@ function getNextGroqKey() {
 }
 
 // ── Whisper ───────────────────────────────────────────────────────────────────
+// CHANGED: accepts `language` param — forces bn/hi/en on Groq Whisper
+// instead of relying on auto-detection. Better Bengali/Hindi accuracy.
 
-async function callGroqWhisper(audioBuffer, mimeType) {
+async function callGroqWhisper(audioBuffer, mimeType, language) {
   const maxRetries = groqApiKeys.length;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const apiKey = getNextGroqKey();
@@ -118,6 +117,13 @@ async function callGroqWhisper(audioBuffer, mimeType) {
       });
       formData.append("model", "whisper-large-v3");
       formData.append("response_format", "json");
+
+      // CHANGED: force language when provided (e.g. bn-IN → bn, hi-IN → hi)
+      // Prevents Whisper auto-detecting wrong language on accented speech
+      if (language && language !== "auto") {
+        const langCode = language.split("-")[0]; // "bn-IN" → "bn"
+        formData.append("language", langCode);
+      }
 
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
@@ -339,8 +345,10 @@ async function flushBuffer(bufferKey, session_id, source) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // Transcribe — protected
+// CHANGED: reads `language` from req.body, passes to callGroqWhisper
+// Works for both mic and system audio (source param distinguishes)
 app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
-  const { session_id, source } = req.body;
+  const { session_id, source, language } = req.body; // CHANGED: added language
   if (!session_id) return res.status(400).json({ error: "session_id required" });
   if (!req.file) return res.status(400).json({ error: "audio required" });
 
@@ -351,7 +359,8 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
   }
 
   try {
-    const original = await callGroqWhisper(req.file.buffer, req.file.mimetype);
+    // CHANGED: pass language so Whisper forces bn/hi/en instead of auto-detect
+    const original = await callGroqWhisper(req.file.buffer, req.file.mimetype, language);
     if (!original) return res.json({ text: "" });
 
     console.log(`[${session_id}][${source}] raw: ${original}`);
@@ -450,7 +459,6 @@ app.post("/push", protect, async (req, res) => {
   try {
     const session = await Session.findOne({ session_id });
     if (!session) return res.status(404).json({ error: "session not found" });
-    // Ownership check — allow if no userId (legacy) or matches
     if (session.userId && session.userId !== req.user.id) {
       return res.status(403).json({ error: "Forbidden" });
     }
@@ -481,7 +489,6 @@ app.get("/transcript/:session_id", protect, async (req, res) => {
   try {
     const session = await Session.findOne({
       session_id: req.params.session_id,
-      // Allow: user owns it OR legacy record (no userId)
       $or: [
         { userId: req.user.id },
         { userId: { $exists: false } },
@@ -502,7 +509,6 @@ app.post("/upload-audio", protect, upload.single("audio"), async (req, res) => {
     return res.status(400).json({ error: "session_id and audio file required" });
   }
 
-  // Ownership check
   const session = await Session.findOne({ session_id });
   if (session && session.userId && session.userId !== req.user.id) {
     return res.status(403).json({ error: "Forbidden" });
@@ -564,7 +570,7 @@ app.get("/audio/:session_id", protect, async (req, res) => {
   }
 });
 
-// AI Insights — protected (stateless, no ownership filter needed)
+// AI Insights — protected
 app.post("/ai-insights", protect, async (req, res) => {
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt required" });

@@ -18,8 +18,21 @@ import InsightsPanel from "./InsightsPanel";
 import "./index.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
-const SpeechRecognition =
-  window.SpeechRecognition || window.webkitSpeechRecognition;
+
+// ── VAD: RMS energy gate ──────────────────────────────────────────────────────
+async function hasVoiceActivity(blob) {
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const data = new Int16Array(arrayBuffer);
+    if (data.length === 0) return false;
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
+    return rms > 300; // tune: raise to 500 if too sensitive
+  } catch {
+    return true; // on error, let Whisper decide
+  }
+}
 
 function App() {
   const [lines, setLines] = useState([]);
@@ -51,8 +64,12 @@ function App() {
   const inputLangRef = useRef("bn-IN");
   const sessionStartAtRef = useRef(0);
 
-  const recognitionRef = useRef(null);
+  // Mic Whisper loop refs (replaces Web Speech API)
+  const micMediaRecorderRef = useRef(null);
+  const micChunksRef = useRef([]);
+  const micRunningRef = useRef(false);
 
+  // System audio refs
   const systemMediaRecorderRef = useRef(null);
   const systemChunksRef = useRef([]);
   const displayStreamRef = useRef(null);
@@ -147,117 +164,100 @@ function App() {
     return () => clearInterval(timer);
   }, [isRunning]);
 
-  const translateToEnglish = async (text, sourceLang) => {
-    if (!text) return "";
-
-    if (sourceLang.startsWith("en")) return text;
-
-    try {
-      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(
-        text,
-      )}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      return (
-        data[0]
-          .map((c) => c[0])
-          .join(" ")
-          .trim() || text
-      );
-    } catch {
-      return text;
-    }
-  };
-
-  const sendAudioChunk = async (blob, sid) => {
+  // ── Shared: send audio chunk to /transcribe via Whisper ───────────────────
+  const sendAudioChunk = async (blob, sid, source = "system") => {
     if (!blob || blob.size < 1000 || !sid) return;
+
+    // VAD gate — skip silent chunks
+    const hasVoice = await hasVoiceActivity(blob);
+    if (!hasVoice) {
+      console.log(`[${source}] VAD: silent chunk skipped`);
+      return;
+    }
+
     try {
       const formData = new FormData();
       formData.append("audio", blob, "audio.webm");
       formData.append("session_id", sid);
-      formData.append("source", "system");
+      formData.append("source", source);
       formData.append("language", inputLangRef.current);
 
+      const token = getToken();
       const res = await axios.post(`${API}/transcribe`, formData, {
-        headers: { "Content-Type": "multipart/form-data" },
+        headers: {
+          "Content-Type": "multipart/form-data",
+          Authorization: `Bearer ${token}`,
+        },
       });
 
       if (res.data.text) {
         setLines((prev) => [
           ...prev,
           {
-            source: "system",
+            source,
             text: res.data.text,
             timestamp: res.data.timestamp || formatTime(new Date()),
           },
         ]);
       }
     } catch (err) {
-      console.error("Transcribe error:", err);
+      console.error(`${source} transcribe error:`, err);
     }
   };
 
-  const startMicRecognition = (sid) => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome — Web Speech API not supported.");
-      return;
-    }
+  // ── Mic: MediaRecorder loop → Whisper (replaces Web Speech API) ──────────
+  const startMicWhisper = async (sid) => {
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micRunningRef.current = true;
 
-    const rec = new SpeechRecognition();
-    rec.continuous = false;
-    rec.interimResults = false;
-    rec.lang = inputLangRef.current;
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
 
-    rec.onresult = async (e) => {
-      const transcript = Array.from(e.results)
-        .filter((r) => r.isFinal)
-        .map((r) => r[0].transcript)
-        .join(" ")
-        .trim();
+      const loop = () => {
+        if (!micRunningRef.current || sessionIdRef.current !== sid) {
+          micStream.getTracks().forEach((t) => t.stop());
+          return;
+        }
 
-      if (!transcript) return;
+        micChunksRef.current = [];
+        const recorder = new MediaRecorder(micStream, { mimeType });
+        micMediaRecorderRef.current = recorder;
 
-      const english = await translateToEnglish(
-        transcript,
-        inputLangRef.current,
-      );
+        recorder.ondataavailable = (e) => {
+          if (e.data?.size > 0) micChunksRef.current.push(e.data);
+        };
 
-      const timestamp = formatTime(new Date());
+        recorder.onstop = async () => {
+          const chunks = [...micChunksRef.current];
+          micChunksRef.current = [];
+          if (chunks.length > 0) {
+            const blob = new Blob(chunks, { type: mimeType });
+            await sendAudioChunk(blob, sid, "mic");
+          }
+          loop(); // restart immediately
+        };
 
-      setLines((prev) => [
-        ...prev,
-        { source: "mic", text: english, timestamp },
-      ]);
+        recorder.start();
+        setTimeout(() => {
+          if (recorder.state === "recording") recorder.stop();
+        }, 8000); // 8s chunks for better sentence context
+      };
 
-      try {
-        await axios.post(`${API}/push`, {
-          session_id: sid,
-          text: `[MIC] [${timestamp}] ${english}`,
-        });
-      } catch {}
-    };
-
-    rec.onerror = (e) => {
-      if (e.error === "not-allowed") {
+      loop();
+    } catch (err) {
+      if (err.name === "NotAllowedError") {
         setErrorMsg("Mic permission denied.");
         stopSession();
+      } else {
+        console.error("Mic recorder error:", err);
+        setErrorMsg("Could not access microphone.");
       }
-    };
-
-    rec.onend = () => {
-      if (isRunningRef.current && sessionIdRef.current === sid) {
-        setTimeout(() => startMicRecognition(sid), 200);
-      }
-    };
-
-    try {
-      rec.start();
-      recognitionRef.current = rec;
-    } catch {
-      setTimeout(() => startMicRecognition(sid), 500);
     }
   };
 
+  // ── System audio: separate stream → Whisper ───────────────────────────────
   const startSystemAudio = (sid, displayStream) => {
     if (!displayStream || displayStream.getAudioTracks().length === 0) return;
 
@@ -278,7 +278,7 @@ function App() {
       if (systemChunksRef.current.length > 0) {
         const blob = new Blob(systemChunksRef.current, { type: mimeType });
         systemChunksRef.current = [];
-        await sendAudioChunk(blob, sid);
+        await sendAudioChunk(blob, sid, "system");
       }
 
       if (
@@ -290,65 +290,24 @@ function App() {
         recorder.start();
         setTimeout(() => {
           if (recorder.state === "recording") recorder.stop();
-        }, 5000);
+        }, 8000); // 8s chunks
       }
     };
 
     recorder.start();
     setTimeout(() => {
       if (recorder.state === "recording") recorder.stop();
-    }, 5000);
+    }, 8000); // 8s chunks
   };
 
-  // --- Corrected: starts recording after system stream is known ---
-  const startMicrophoneRecording = async (sid, systemStreamParam) => {
+  // ── Full session recording (mic only, for Cloudinary audio backup) ────────
+  const startMicrophoneRecording = async (sid) => {
+    // NOTE: transcription is handled by startMicWhisper separately.
+    // This records mic-only audio for the downloadable session recording.
     try {
-      // Use passed stream or fallback to ref (which may be null)
-      const systemStream = systemStreamParam || displayStreamRef.current;
-
-      if (!systemStream || systemStream.getAudioTracks().length === 0) {
-        console.warn("No system audio stream available – recording mic only");
-      }
-
-      const micStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
-
-      // Fallback: mic only if no system audio
-      if (!systemStream || systemStream.getAudioTracks().length === 0) {
-        const mimeType = MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "audio/mp4";
-        const recorder = new MediaRecorder(micStream, { mimeType });
-        const chunks = [];
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data);
-        };
-        recorder.onstop = async () => {
-          const blob = new Blob(chunks, { type: mimeType });
-          await uploadAudioRecording(sid, blob);
-          micStream.getTracks().forEach((t) => t.stop());
-        };
-        recorder.start(1000);
-        setAudioRecorder(recorder);
-        setIsRecordingAudio(true);
-        return;
-      }
-
-      // Mix both streams
-      const audioContext = new AudioContext();
-      const micSource = audioContext.createMediaStreamSource(micStream);
-      const systemSource = audioContext.createMediaStreamSource(systemStream);
-
-      const destination = audioContext.createMediaStreamDestination();
-      micSource.connect(destination);
-      systemSource.connect(destination);
-
-      const mixedStream = destination.stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm")
-        ? "audio/webm"
-        : "audio/mp4";
-      const recorder = new MediaRecorder(mixedStream, { mimeType });
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+      const recorder = new MediaRecorder(micStream, { mimeType });
       const chunks = [];
 
       recorder.ondataavailable = (e) => {
@@ -358,14 +317,13 @@ function App() {
         const blob = new Blob(chunks, { type: mimeType });
         await uploadAudioRecording(sid, blob);
         micStream.getTracks().forEach((t) => t.stop());
-        audioContext.close();
       };
+
       recorder.start(1000);
       setAudioRecorder(recorder);
       setIsRecordingAudio(true);
     } catch (err) {
-      console.error("Mixed recording error:", err);
-      setErrorMsg("Could not access microphone for recording.");
+      console.error("Session recording error:", err);
     }
   };
 
@@ -374,8 +332,12 @@ function App() {
     formData.append("audio", blob, "recording.webm");
     formData.append("session_id", sessionId);
     try {
+      const token = getToken();
       const res = await axios.post(`${API}/upload-audio`, formData, {
-        headers: { "Content-Type": "multipart/form-data" },
+        headers: {
+          "Content-Type": "multipart/form-data",
+          Authorization: `Bearer ${token}`,
+        },
       });
       setAudioUrl(res.data.audioUrl);
       setAudioDuration(res.data.audioDuration);
@@ -410,8 +372,10 @@ function App() {
       return;
     }
     try {
+      const token = getToken();
       const transcriptRes = await axios.get(
         `${API}/transcript/${selectedSession}`,
+        { headers: { Authorization: `Bearer ${token}` } },
       );
       const transcriptText = transcriptRes.data.text;
       if (!transcriptText.trim()) {
@@ -445,7 +409,11 @@ Return this exact JSON shape:
 
 Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensure quiz options array has exactly 4 items and answer matches one option exactly.`;
 
-      const res = await axios.post(`${API}/ai-insights`, { prompt });
+      const res = await axios.post(
+        `${API}/ai-insights`,
+        { prompt },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
       setInsights(res.data);
     } catch (err) {
       setErrorMsg("Failed to regenerate insights.");
@@ -453,12 +421,8 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     }
   };
 
+  // ── Start session ─────────────────────────────────────────────────────────
   const startSession = async () => {
-    if (!SpeechRecognition) {
-      setErrorMsg("Use Chrome on desktop.");
-      return;
-    }
-
     setErrorMsg("");
     setSystemAudioTip("");
     setCopyStatus("");
@@ -468,9 +432,12 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     setIsRecordingAudio(false);
 
     try {
-      const res = await axios.post(`${API}/start-session`, {
-        language: inputLangRef.current,
-      });
+      const token = getToken();
+      const res = await axios.post(
+        `${API}/start-session`,
+        { language: inputLangRef.current },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
 
       const newSessionId = res.data.session_id;
 
@@ -481,9 +448,13 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       setIsRunning(true);
       setAudioSources(["mic"]);
 
-      startMicRecognition(newSessionId);
+      // Start mic transcription via Whisper (no Web Speech API)
+      startMicWhisper(newSessionId);
 
-      // Try to get system audio first, then start recording
+      // Start mic-only session recording (for Cloudinary backup)
+      startMicrophoneRecording(newSessionId);
+
+      // Try to get system audio
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -505,20 +476,15 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
             }
             displayStreamRef.current = null;
           };
-          // ✅ Start recording AFTER system audio is confirmed
-          startMicrophoneRecording(newSessionId, displayStream);
         } else {
           displayStream.getTracks().forEach((t) => t.stop());
           setSystemAudioTip(
             "Tip: tick 'Share tab audio' in the screen share dialog.",
           );
-          // Start recording with mic only
-          startMicrophoneRecording(newSessionId, null);
         }
-      } catch (err) {
-        // User denied screen share or error – record mic only
-        console.warn("No screen share, recording mic only");
-        startMicrophoneRecording(newSessionId, null);
+      } catch {
+        // User denied screen share — mic-only mode, already running
+        console.warn("No screen share, mic-only mode");
       }
     } catch (err) {
       console.error(err);
@@ -529,29 +495,32 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     }
   };
 
+  // ── Stop session ──────────────────────────────────────────────────────────
   const stopSession = () => {
     isRunningRef.current = false;
     sessionIdRef.current = "";
 
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch {}
-      recognitionRef.current = null;
+    // Stop mic Whisper loop
+    micRunningRef.current = false;
+    if (micMediaRecorderRef.current?.state === "recording") {
+      try { micMediaRecorderRef.current.stop(); } catch {}
+      micMediaRecorderRef.current = null;
     }
+    micChunksRef.current = [];
 
+    // Stop system audio recorder
     if (systemMediaRecorderRef.current?.state === "recording") {
-      try {
-        systemMediaRecorderRef.current.stop();
-      } catch {}
+      try { systemMediaRecorderRef.current.stop(); } catch {}
       systemMediaRecorderRef.current = null;
     }
 
+    // Stop display stream
     if (displayStreamRef.current) {
       displayStreamRef.current.getTracks().forEach((t) => t.stop());
       displayStreamRef.current = null;
     }
 
+    // Stop session recording
     if (audioRecorder && audioRecorder.state === "recording") {
       audioRecorder.stop();
       setIsRecordingAudio(false);
@@ -565,7 +534,10 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const res = await axios.get(`${API}/transcripts`);
+        const token = getToken();
+        const res = await axios.get(`${API}/transcripts`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
         setSessions(res.data);
       } catch {}
     }, 3000);
@@ -578,14 +550,19 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     try {
       setSelectedSession(sid);
       setSessionQuery("");
-      const res = await axios.get(`${API}/transcript/${sid}`);
+      const token = getToken();
+      const res = await axios.get(`${API}/transcript/${sid}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       const parsed = res.data.text
         .split("\n")
         .filter((l) => l.trim())
         .map(parseTranscriptLine);
 
       setLines(parsed);
-      const audioRes = await axios.get(`${API}/audio/${sid}`);
+      const audioRes = await axios.get(`${API}/audio/${sid}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       setAudioUrl(audioRes.data.audioUrl || "");
       setAudioDuration(audioRes.data.audioDuration || 0);
     } catch {}
