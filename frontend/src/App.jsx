@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import { getToken } from "./auth";
 import {
@@ -20,11 +20,9 @@ import "./index.css";
 const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 // ── Client-side VAD: decode WebM → PCM → RMS ─────────────────────────────────
-// This is the correct way. Raw webm bytes → garbage RMS. Decoded PCM → real RMS.
 async function getAudioRMS(blob) {
   try {
     const arrayBuffer = await blob.arrayBuffer();
-    // OfflineAudioContext decodes the container properly to raw PCM
     const audioCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 44100, 44100);
     const decoded = await audioCtx.decodeAudioData(arrayBuffer);
     const data = decoded.getChannelData(0);
@@ -32,14 +30,12 @@ async function getAudioRMS(blob) {
     for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
     return Math.sqrt(sum / data.length);
   } catch {
-    // If decode fails (too short, corrupt) → treat as silence
     return 0;
   }
 }
 
-// RMS threshold: Wispr Flow uses ~0.01 for speech detection
-// Values below this = silence / near-silence = skip Whisper entirely
 const RMS_THRESHOLD = 0.008;
+const LOOP_MS = 10000; // both mic and system use same 10s window
 
 function App() {
   const [lines, setLines] = useState([]);
@@ -56,13 +52,6 @@ function App() {
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [insights, setInsights] = useState(null);
-
-  // PTT state
-  const [isPTTActive, setIsPTTActive] = useState(false);
-  const [pttStatus, setPTTStatus] = useState(""); // "recording" | "processing" | "vad_skip" | ""
-
-  // Audio recording state (full session backup for Cloudinary)
-  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
   const [audioUrl, setAudioUrl] = useState("");
   const [audioDuration, setAudioDuration] = useState(0);
 
@@ -74,14 +63,9 @@ function App() {
   const inputLangRef = useRef("bn-IN");
   const sessionStartAtRef = useRef(0);
 
-  // PTT refs
-  const pttRecorderRef = useRef(null);
-  const pttChunksRef = useRef([]);
-  const pttActiveRef = useRef(false);
+  // Mic loop refs (mirrors system — no PTT)
+  const micMediaRecorderRef = useRef(null);
   const micStreamRef = useRef(null);
-  const pttMimeTypeRef = useRef("audio/webm");
-  const sessionRecordingChunksRef = useRef([]);
-  const pttStartTimeRef = useRef(0); // track hold duration
 
   // System audio refs
   const systemMediaRecorderRef = useRef(null);
@@ -90,41 +74,28 @@ function App() {
   const captureModeLabel = !isRunning
     ? "Idle"
     : audioSources.includes("mic") && audioSources.includes("system")
-      ? "PTT Mic + System Audio"
+      ? "Mic + System Audio"
       : audioSources.includes("mic")
-        ? "PTT Mic Only"
+        ? "Mic Only"
         : "System Audio Only";
 
-  const formatTime = (timestamp) =>
-    timestamp.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-    });
+  const formatTime = (ts) =>
+    ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 
   const formatDuration = (seconds) => {
-    const safeSeconds = Math.max(0, seconds);
-    const hours = Math.floor(safeSeconds / 3600);
-    const minutes = Math.floor((safeSeconds % 3600) / 60);
-    const remainingSeconds = safeSeconds % 60;
-    const parts = [minutes, remainingSeconds].map((v) => String(v).padStart(2, "0"));
-    return hours > 0 ? `${hours}:${parts[0]}:${parts[1]}` : `${parts[0]}:${parts[1]}`;
+    const s = Math.max(0, seconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const parts = [m, sec].map((v) => String(v).padStart(2, "0"));
+    return h > 0 ? `${h}:${parts[0]}:${parts[1]}` : `${parts[0]}:${parts[1]}`;
   };
 
   const parseTranscriptLine = (line) => {
-    const timestampedMatch = line.match(/^\[(MIC|SYSTEM)\]\s+\[(.*?)\]\s*(.*)$/);
-    if (timestampedMatch) {
-      return {
-        source: timestampedMatch[1].toLowerCase(),
-        timestamp: timestampedMatch[2],
-        text: timestampedMatch[3] || "",
-      };
-    }
-    if (line.startsWith("[MIC] "))
-      return { source: "mic", timestamp: "", text: line.replace("[MIC] ", "") };
-    if (line.startsWith("[SYSTEM] "))
-      return { source: "system", timestamp: "", text: line.replace("[SYSTEM] ", "") };
+    const m = line.match(/^\[(MIC|SYSTEM)\]\s+\[(.*?)\]\s*(.*)$/);
+    if (m) return { source: m[1].toLowerCase(), timestamp: m[2], text: m[3] || "" };
+    if (line.startsWith("[MIC] ")) return { source: "mic", timestamp: "", text: line.replace("[MIC] ", "") };
+    if (line.startsWith("[SYSTEM] ")) return { source: "system", timestamp: "", text: line.replace("[SYSTEM] ", "") };
     return { source: "system", timestamp: "", text: line };
   };
 
@@ -134,19 +105,14 @@ function App() {
       : `[${line.source.toUpperCase()}] ${line.text}`;
 
   const filteredSessions = sessions.filter(
-    (s) =>
-      s.label.toLowerCase().includes(sessionQuery.toLowerCase()) ||
-      s.id.toLowerCase().includes(sessionQuery.toLowerCase()),
+    (s) => s.label.toLowerCase().includes(sessionQuery.toLowerCase()) ||
+           s.id.toLowerCase().includes(sessionQuery.toLowerCase()),
   );
 
   useEffect(() => { inputLangRef.current = inputLang; }, [inputLang]);
 
   useEffect(() => {
-    if (!isRunning) {
-      sessionSeconds && setSessionSeconds(0);
-      sessionStartAtRef.current = 0;
-      return;
-    }
+    if (!isRunning) { sessionSeconds && setSessionSeconds(0); sessionStartAtRef.current = 0; return; }
     sessionStartAtRef.current = Date.now();
     setSessionSeconds(0);
     const timer = setInterval(() => {
@@ -155,8 +121,8 @@ function App() {
     return () => clearInterval(timer);
   }, [isRunning]);
 
-  // ── Send audio blob to /transcribe ────────────────────────────────────────
-  const sendAudioChunk = async (blob, sid, source = "system") => {
+  // ── Send blob to /transcribe ──────────────────────────────────────────────
+  const sendAudioChunk = async (blob, sid, source) => {
     if (!blob || blob.size < 1000 || !sid) return;
     try {
       const formData = new FormData();
@@ -164,165 +130,29 @@ function App() {
       formData.append("session_id", sid);
       formData.append("source", source);
       formData.append("language", inputLangRef.current);
-
       const token = getToken();
       const res = await axios.post(`${API}/transcribe`, formData, {
-        headers: {
-          "Content-Type": "multipart/form-data",
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "multipart/form-data", Authorization: `Bearer ${token}` },
       });
-
       if (res.data.text) {
-        setLines((prev) => [
-          ...prev,
-          {
-            source,
-            text: res.data.text,
-            timestamp: res.data.timestamp || formatTime(new Date()),
-          },
-        ]);
+        setLines((prev) => [...prev, {
+          source,
+          text: res.data.text,
+          timestamp: res.data.timestamp || formatTime(new Date()),
+        }]);
       }
     } catch (err) {
       console.error(`${source} transcribe error:`, err);
     }
   };
 
-  // ── PTT: start recording ──────────────────────────────────────────────────
-  const startPTT = useCallback(() => {
-    if (!isRunningRef.current) return;
-    if (pttActiveRef.current) return;
-    if (!micStreamRef.current) return;
+  // ── Generic overlapping 10s loop ─────────────────────────────────────────
+  // Used by BOTH mic and system — identical logic, different stream + ref.
+  // Starts next recorder BEFORE stopping previous → zero gap in capture.
+  const startAudioLoop = (sid, stream, recorderRef, source) => {
+    if (!stream || stream.getAudioTracks().length === 0) return;
 
-    pttActiveRef.current = true;
-    pttStartTimeRef.current = Date.now();
-    setIsPTTActive(true);
-    setPTTStatus("recording");
-
-    pttChunksRef.current = [];
-
-    const mimeType = pttMimeTypeRef.current;
-    const recorder = new MediaRecorder(micStreamRef.current, { mimeType });
-    pttRecorderRef.current = recorder;
-
-    recorder.ondataavailable = (e) => {
-      if (e.data?.size > 0) pttChunksRef.current.push(e.data);
-    };
-
-    recorder.onstop = async () => {
-      pttActiveRef.current = false;
-      setIsPTTActive(false);
-
-      const holdDuration = Date.now() - pttStartTimeRef.current;
-      const chunks = [...pttChunksRef.current];
-      pttChunksRef.current = [];
-
-      // Too short = accidental tap (< 300ms)
-      if (chunks.length === 0 || holdDuration < 300) {
-        setPTTStatus("");
-        return;
-      }
-
-      const blob = new Blob(chunks, { type: mimeType });
-
-      // Blob too small = silence
-      if (blob.size < 3000) {
-        setPTTStatus("");
-        return;
-      }
-
-      // ── CLIENT-SIDE VAD: decode PCM and check RMS ──────────────────────
-      // This is the key fix. We decode the WebM to actual PCM samples,
-      // then compute RMS. Raw webm bytes give garbage RMS values.
-      setPTTStatus("processing");
-      const rms = await getAudioRMS(blob);
-      console.log(`[PTT VAD] RMS=${rms.toFixed(4)}, holdMs=${holdDuration}, size=${blob.size}`);
-
-      if (rms < RMS_THRESHOLD) {
-        console.log(`[PTT VAD] Silence detected (RMS=${rms.toFixed(4)} < ${RMS_THRESHOLD}), skipping Whisper`);
-        setPTTStatus("");
-        return;
-      }
-
-      // Collect for full-session Cloudinary backup
-      sessionRecordingChunksRef.current.push(blob);
-
-      const sid = sessionIdRef.current;
-      if (sid) {
-        await sendAudioChunk(blob, sid, "mic");
-      }
-      setPTTStatus("");
-    };
-
-    recorder.start();
-  }, []);
-
-  // ── PTT: stop recording ───────────────────────────────────────────────────
-  const stopPTT = useCallback(() => {
-    if (!pttActiveRef.current) return;
-    if (pttRecorderRef.current?.state === "recording") {
-      pttRecorderRef.current.stop();
-    }
-  }, []);
-
-  // ── Keyboard PTT: Space bar ───────────────────────────────────────────────
-  useEffect(() => {
-    const onKeyDown = (e) => {
-      if (
-        e.target.tagName === "INPUT" ||
-        e.target.tagName === "TEXTAREA" ||
-        e.target.tagName === "SELECT"
-      ) return;
-      if (e.code === "Space" && !e.repeat) {
-        e.preventDefault();
-        startPTT();
-      }
-    };
-    const onKeyUp = (e) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        stopPTT();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-    };
-  }, [startPTT, stopPTT]);
-
-  // ── Init mic stream ───────────────────────────────────────────────────────
-  const initMicStream = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = stream;
-      pttMimeTypeRef.current = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-      return true;
-    } catch (err) {
-      setErrorMsg(err.name === "NotAllowedError" ? "Mic permission denied." : "Could not access microphone.");
-      return false;
-    }
-  };
-
-  // ── System audio: continuous 10s loop with OVERLAPPING recorders ─────────
-  // Same shape as the mic PTT path (record → onstop → VAD → /transcribe),
-  // except instead of stop-on-release it auto-cycles every 10 seconds.
-  //
-  // Key property: audio capture is NEVER paused. Every 10s we spin up a
-  // fresh MediaRecorder *before* stopping the previous one. The previous
-  // recorder's onstop then fires asynchronously and ships its 10s blob to
-  // /transcribe, while the new recorder is already capturing the next 10s.
-  // Result: the user can keep talking through the upload/transcription —
-  // nothing is dropped between windows.
-  const SYSTEM_LOOP_MS = 10000;
-
-  const startSystemAudio = (sid, displayStream) => {
-    if (!displayStream || displayStream.getAudioTracks().length === 0) return;
-
-    const audioStream = new MediaStream(displayStream.getAudioTracks());
+    const audioStream = new MediaStream(stream.getAudioTracks());
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
       : "audio/webm";
@@ -330,11 +160,9 @@ function App() {
     const stillActive = () =>
       isRunningRef.current &&
       sessionIdRef.current === sid &&
-      displayStream.active;
+      stream.active;
 
-    // Build one recorder for one 10s window. Each recorder owns its OWN
-    // chunks array via closure, so two overlapping recorders never share state.
-    const buildWindowRecorder = () => {
+    const buildRecorder = () => {
       const chunks = [];
       const recorder = new MediaRecorder(audioStream, { mimeType });
 
@@ -342,20 +170,16 @@ function App() {
         if (e.data?.size > 0) chunks.push(e.data);
       };
 
-      // Fires AFTER we've already started the next recorder, so this work
-      // (RMS decode + network upload) happens with no impact on capture.
       recorder.onstop = async () => {
         if (chunks.length === 0) return;
         const blob = new Blob(chunks, { type: mimeType });
-
-        // Same client-side VAD used by the mic PTT path
         const rms = await getAudioRMS(blob);
-        console.log(`[SYS VAD] RMS=${rms.toFixed(4)}, size=${blob.size}`);
+        console.log(`[${source.toUpperCase()} VAD] RMS=${rms.toFixed(4)}, size=${blob.size}`);
         if (rms < RMS_THRESHOLD) {
-          console.log(`[SYS VAD] Silent 10s chunk skipped (RMS=${rms.toFixed(4)})`);
+          console.log(`[${source.toUpperCase()} VAD] silent 10s chunk skipped`);
           return;
         }
-        await sendAudioChunk(blob, sid, "system");
+        await sendAudioChunk(blob, sid, source);
       };
 
       return recorder;
@@ -363,57 +187,27 @@ function App() {
 
     const cycle = () => {
       if (!stillActive()) return;
-
-      // 1. Start the NEW recorder first → audio capture stays continuous.
-      const next = buildWindowRecorder();
+      // Start next BEFORE stopping prev → seamless capture
+      const next = buildRecorder();
       next.start();
-
-      // 2. Stop the previous recorder → its onstop ships the just-finished
-      //    10s chunk asynchronously while `next` keeps recording.
-      const prev = systemMediaRecorderRef.current;
-      systemMediaRecorderRef.current = next;
+      const prev = recorderRef.current;
+      recorderRef.current = next;
       if (prev && prev.state === "recording") {
         try { prev.stop(); } catch {}
       }
-
-      // 3. Schedule the next rollover.
-      setTimeout(cycle, SYSTEM_LOOP_MS);
+      setTimeout(cycle, LOOP_MS);
     };
 
-    // Kick the loop off with the first window.
-    const first = buildWindowRecorder();
-    systemMediaRecorderRef.current = first;
+    // First window
+    const first = buildRecorder();
+    recorderRef.current = first;
     first.start();
-    setTimeout(cycle, SYSTEM_LOOP_MS);
+    setTimeout(cycle, LOOP_MS);
   };
 
-  // ── Upload all PTT blobs as one session recording ─────────────────────────
-  const uploadSessionRecording = async (sid) => {
-    const allChunks = sessionRecordingChunksRef.current;
-    if (allChunks.length === 0) return;
-
-    const mimeType = pttMimeTypeRef.current || "audio/webm";
-    const blob = new Blob(allChunks, { type: mimeType });
-    sessionRecordingChunksRef.current = [];
-
-    const formData = new FormData();
-    formData.append("audio", blob, "recording.webm");
-    formData.append("session_id", sid);
-    try {
-      const token = getToken();
-      const res = await axios.post(`${API}/upload-audio`, formData, {
-        headers: {
-          "Content-Type": "multipart/form-data",
-          Authorization: `Bearer ${token}`,
-        },
-      });
-      setAudioUrl(res.data.audioUrl);
-      setAudioDuration(res.data.audioDuration);
-    } catch (err) {
-      console.error("Upload failed:", err);
-      setErrorMsg("Failed to save recording.");
-    }
-  };
+  // ── Upload mic recording chunks (session backup) ──────────────────────────
+  // Not needed anymore since we're not collecting PTT blobs,
+  // but keep the upload endpoint call on stopSession for any future use.
 
   const downloadAudio = async () => {
     if (!audioUrl) return;
@@ -428,9 +222,7 @@ function App() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-    } catch (err) {
-      setErrorMsg("Failed to download recording.");
-    }
+    } catch { setErrorMsg("Failed to download recording."); }
   };
 
   const regenerateInsightsFromTranscript = async () => {
@@ -473,9 +265,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
         headers: { Authorization: `Bearer ${token}` },
       });
       setInsights(res.data);
-    } catch (err) {
-      setErrorMsg("Failed to regenerate insights.");
-    }
+    } catch { setErrorMsg("Failed to regenerate insights."); }
   };
 
   // ── Start session ─────────────────────────────────────────────────────────
@@ -486,12 +276,15 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     setLines([]);
     setAudioUrl("");
     setAudioDuration(0);
-    setIsRecordingAudio(false);
-    setPTTStatus("");
-    sessionRecordingChunksRef.current = [];
 
-    const micOk = await initMicStream();
-    if (!micOk) return;
+    // Request mic permission
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = micStream;
+    } catch (err) {
+      setErrorMsg(err.name === "NotAllowedError" ? "Mic permission denied." : "Could not access microphone.");
+      return;
+    }
 
     try {
       const token = getToken();
@@ -508,8 +301,11 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       setSelectedSession(newSessionId);
       setIsRunning(true);
       setAudioSources(["mic"]);
-      setIsRecordingAudio(true);
 
+      // Start mic loop immediately — always on, no PTT
+      startAudioLoop(newSessionId, micStreamRef.current, micMediaRecorderRef, "mic");
+
+      // Try system audio
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -521,12 +317,12 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
         if (displayStream.getAudioTracks().length > 0) {
           setSystemAudioTip("");
           setAudioSources(["mic", "system"]);
-          startSystemAudio(newSessionId, displayStream);
+          startAudioLoop(newSessionId, displayStream, systemMediaRecorderRef, "system");
 
           displayStream.getAudioTracks()[0].onended = () => {
             setAudioSources((prev) => prev.filter((s) => s !== "system"));
             if (systemMediaRecorderRef.current?.state === "recording") {
-              systemMediaRecorderRef.current.stop();
+              try { systemMediaRecorderRef.current.stop(); } catch {}
             }
             displayStreamRef.current = null;
           };
@@ -535,35 +331,26 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           setSystemAudioTip("Tip: tick 'Share tab audio' in the screen share dialog.");
         }
       } catch {
-        console.warn("No screen share, mic PTT only");
+        console.warn("No screen share — mic only");
       }
     } catch (err) {
       console.error(err);
       setErrorMsg("Failed to start. Check server.");
       isRunningRef.current = false;
       setIsRunning(false);
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach((t) => t.stop());
-        micStreamRef.current = null;
-      }
+      if (micStreamRef.current) { micStreamRef.current.getTracks().forEach((t) => t.stop()); micStreamRef.current = null; }
     }
   };
 
   // ── Stop session ──────────────────────────────────────────────────────────
   const stopSession = async () => {
-    const sid = sessionIdRef.current;
     isRunningRef.current = false;
     sessionIdRef.current = "";
 
-    pttActiveRef.current = false;
-    if (pttRecorderRef.current?.state === "recording") {
-      try { pttRecorderRef.current.stop(); } catch {}
+    if (micMediaRecorderRef.current?.state === "recording") {
+      try { micMediaRecorderRef.current.stop(); } catch {}
+      micMediaRecorderRef.current = null;
     }
-    pttRecorderRef.current = null;
-    pttChunksRef.current = [];
-    setIsPTTActive(false);
-    setPTTStatus("");
-
     if (micStreamRef.current) {
       micStreamRef.current.getTracks().forEach((t) => t.stop());
       micStreamRef.current = null;
@@ -578,9 +365,6 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       displayStreamRef.current = null;
     }
 
-    if (sid) await uploadSessionRecording(sid);
-
-    setIsRecordingAudio(false);
     setIsRunning(false);
     setAudioSources([]);
     setSystemAudioTip("");
@@ -590,9 +374,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     const interval = setInterval(async () => {
       try {
         const token = getToken();
-        const res = await axios.get(`${API}/transcripts`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await axios.get(`${API}/transcripts`, { headers: { Authorization: `Bearer ${token}` } });
         setSessions(res.data);
       } catch {}
     }, 3000);
@@ -605,19 +387,14 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       setSelectedSession(sid);
       setSessionQuery("");
       const token = getToken();
-      const res = await axios.get(`${API}/transcript/${sid}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const parsed = res.data.text
-        .split("\n")
-        .filter((l) => l.trim())
-        .map(parseTranscriptLine);
+      const res = await axios.get(`${API}/transcript/${sid}`, { headers: { Authorization: `Bearer ${token}` } });
+      const parsed = res.data.text.split("\n").filter((l) => l.trim()).map(parseTranscriptLine);
       setLines(parsed);
-      const audioRes = await axios.get(`${API}/audio/${sid}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setAudioUrl(audioRes.data.audioUrl || "");
-      setAudioDuration(audioRes.data.audioDuration || 0);
+      try {
+        const audioRes = await axios.get(`${API}/audio/${sid}`, { headers: { Authorization: `Bearer ${token}` } });
+        setAudioUrl(audioRes.data.audioUrl || "");
+        setAudioDuration(audioRes.data.audioDuration || 0);
+      } catch {}
     } catch {}
   };
 
@@ -636,10 +413,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       report.flashcards = insights.flashcards || [];
       report.quiz = insights.quiz || [];
     } else {
-      report.summary = "";
-      report.keyPoints = [];
-      report.flashcards = [];
-      report.quiz = [];
+      report.summary = ""; report.keyPoints = []; report.flashcards = []; report.quiz = [];
     }
     exportPDF(report);
   };
@@ -666,10 +440,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       report.flashcards = insights.flashcards || [];
       report.quiz = insights.quiz || [];
     } else {
-      report.summary = "";
-      report.keyPoints = [];
-      report.flashcards = [];
-      report.quiz = [];
+      report.summary = ""; report.keyPoints = []; report.flashcards = []; report.quiz = [];
     }
     exportWord(report);
   };
@@ -679,17 +450,13 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       {lines.filter(filterFn).map((l, i) => (
         <div key={i} className={`transcript-line ${l.source}`}>
           <div className="line-meta">
-            <span className={`tag tag-${l.source}`}>
-              {l.source === "mic" ? "🎤 MIC" : "🖥 SYS"}
-            </span>
+            <span className={`tag tag-${l.source}`}>{l.source === "mic" ? "🎤 MIC" : "🖥 SYS"}</span>
             <span className="line-time">{l.timestamp || "--:--:--"}</span>
           </div>
           <span className="line-text">{l.text}</span>
         </div>
       ))}
-      {lines.filter(filterFn).length === 0 && (
-        <p className="empty-hint">{emptyMessage}</p>
-      )}
+      {lines.filter(filterFn).length === 0 && <p className="empty-hint">{emptyMessage}</p>}
     </div>
   );
 
@@ -698,9 +465,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
       return (
         <div className="transcript-scroll" ref={ref}>
           <p className="empty-hint">
-            {isRunning
-              ? "Live transcript will appear here as soon as audio is captured."
-              : "Start a session to see the combined transcript here."}
+            {isRunning ? "Live transcript will appear here as soon as audio is captured." : "Start a session to see the combined transcript here."}
           </p>
         </div>
       );
@@ -718,23 +483,13 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
     return (
       <div className="transcript-scroll prose-scroll" ref={ref}>
         {groups.map((g, i) =>
-          g.type === "system" ? (
-            <span key={i} className="prose-sys-text">{g.text} </span>
-          ) : (
-            <div key={i} className="prose-mic-text">{g.text}</div>
-          ),
+          g.type === "system"
+            ? <span key={i} className="prose-sys-text">{g.text} </span>
+            : <div key={i} className="prose-mic-text">{g.text}</div>
         )}
       </div>
     );
   };
-
-  const pttLabel = !isRunning
-    ? "Start session first"
-    : isPTTActive
-      ? "🔴 Recording... (release to send)"
-      : pttStatus === "processing"
-        ? "⏳ Processing..."
-        : "🎤 Hold to Speak  [Space]";
 
   return (
     <div className={darkMode ? "app dark" : "app"}>
@@ -770,12 +525,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
         <div className="right-controls">
           <div className="dropdown-group">
             <div className="dropdown-label">Mic audio language</div>
-            <select
-              value={inputLang}
-              onChange={(e) => setInputLang(e.target.value)}
-              className="dropdown"
-              disabled={isRunning}
-            >
+            <select value={inputLang} onChange={(e) => setInputLang(e.target.value)} className="dropdown" disabled={isRunning}>
               <option value="bn-IN">Bengali</option>
               <option value="hi-IN">Hindi</option>
               <option value="en-IN">English</option>
@@ -795,45 +545,16 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
                   placeholder="Type to filter sessions"
                 />
               </div>
-              <select
-                value={selectedSession}
-                onChange={(e) => loadSession(e.target.value)}
-                className="dropdown"
-              >
+              <select value={selectedSession} onChange={(e) => loadSession(e.target.value)} className="dropdown">
                 <option value="">Previous Sessions</option>
-                {filteredSessions.length > 0 ? (
-                  filteredSessions.map((s) => (
-                    <option key={s.id} value={s.id}>{s.label}</option>
-                  ))
-                ) : (
-                  <option value="" disabled>No matching sessions</option>
-                )}
+                {filteredSessions.length > 0
+                  ? filteredSessions.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)
+                  : <option value="" disabled>No matching sessions</option>}
               </select>
             </>
           )}
         </div>
       </div>
-
-      {/* ── PTT Button ─────────────────────────────────────────────────────── */}
-      {isRunning && (
-        <div className="ptt-container">
-          <button
-            className={`ptt-btn ${isPTTActive ? "ptt-active" : ""} ${pttStatus === "processing" ? "ptt-processing" : ""}`}
-            onMouseDown={startPTT}
-            onMouseUp={stopPTT}
-            onMouseLeave={stopPTT}
-            onTouchStart={(e) => { e.preventDefault(); startPTT(); }}
-            onTouchEnd={(e) => { e.preventDefault(); stopPTT(); }}
-            disabled={pttStatus === "processing"}
-          >
-            <Mic size={20} />
-            <span>{pttLabel}</span>
-          </button>
-          <div className="ptt-hint">
-            System audio (device) is always-on. Hold button or Space bar to speak.
-          </div>
-        </div>
-      )}
 
       {errorMsg && <div className="error-msg">⚠️ {errorMsg}</div>}
       {systemAudioTip && <div className="tip-msg">{systemAudioTip}</div>}
@@ -844,11 +565,9 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
         <span>{isRunning ? "Translation Running" : "Translation Stopped"}</span>
         <div className="status-badge">Mode: {captureModeLabel}</div>
         <div className="status-badge timer-badge">Timer: {formatDuration(sessionSeconds)}</div>
-        <div className={isPTTActive ? "audio-dot active ptt-pulse" : "audio-dot"} />
+        <div className={audioSources.includes("mic") ? "audio-dot active" : "audio-dot"} />
         <Mic size={14} style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }} />
-        <span style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }}>
-          {isPTTActive ? "Speaking" : "Mic (PTT)"}
-        </span>
+        <span style={{ opacity: audioSources.includes("mic") ? 1 : 0.4 }}>Mic</span>
         <div className={audioSources.includes("system") ? "audio-dot system active-system" : "audio-dot system"} />
         <Monitor size={14} style={{ opacity: audioSources.includes("system") ? 1 : 0.4 }} />
         <span style={{ opacity: audioSources.includes("system") ? 1 : 0.4 }}>System</span>
@@ -859,7 +578,7 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
 
       <div className="status-legend">
         <span className="legend-item"><span className="legend-dot legend-running" /> Running</span>
-        <span className="legend-item"><span className="legend-dot legend-mic" /> Mic (PTT)</span>
+        <span className="legend-item"><span className="legend-dot legend-mic" /> Mic (always-on)</span>
         <span className="legend-item"><span className="legend-dot legend-system" /> System (always-on)</span>
       </div>
 
@@ -869,27 +588,10 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           <div className="recording-content">
             <audio controls src={audioUrl} className="audio-player" />
             <div className="recording-actions">
-              <button onClick={downloadAudio} className="recording-btn">
-                <Download size={14} /> Download
-              </button>
-              <button onClick={regenerateInsightsFromTranscript} className="recording-btn">
-                <Sparkles size={14} /> Regenerate AI Insights
-              </button>
+              <button onClick={downloadAudio} className="recording-btn"><Download size={14} /> Download</button>
+              <button onClick={regenerateInsightsFromTranscript} className="recording-btn"><Sparkles size={14} /> Regenerate AI Insights</button>
             </div>
             <div className="recording-duration">Duration: {formatDuration(audioDuration)}</div>
-          </div>
-        </div>
-      )}
-
-      {isRunning && isRecordingAudio && (
-        <div className="recording-card">
-          <div className="recording-header"><Mic size={16} /> Session Active</div>
-          <div className="recording-content">
-            <div className="recording-indicator">
-              {isPTTActive
-                ? "🔴 Mic recording..."
-                : "⚪ Hold Space / button to speak. System audio always-on."}
-            </div>
           </div>
         </div>
       )}
@@ -900,33 +602,24 @@ Generate 5 key points, 3-5 action items, 4-6 flashcards, 4 quiz questions. Ensur
           {renderProse(combinedRef)}
         </div>
         <div className="panel">
-          <div className="panel-header mic-header"><Mic size={14} /> Microphone (PTT)</div>
+          <div className="panel-header mic-header"><Mic size={14} /> Microphone</div>
           {renderTagged(
-            (l) => l.source === "mic",
-            micRef,
-            isRunning ? "Hold Space or the button to speak..." : "Start a session to capture microphone text here.",
+            (l) => l.source === "mic", micRef,
+            isRunning ? "Listening... (10s windows)" : "Start a session to capture microphone text here.",
           )}
         </div>
         <div className="panel">
           <div className="panel-header sys-header"><Monitor size={14} /> System Audio</div>
           {renderTagged(
-            (l) => l.source === "system",
-            sysRef,
+            (l) => l.source === "system", sysRef,
             isRunning
-              ? audioSources.includes("system")
-                ? "Waiting for system audio text..."
-                : "Share tab audio to populate this panel."
+              ? audioSources.includes("system") ? "Listening... (10s windows)" : "Share tab audio to populate this panel."
               : "Start a session and share tab audio to capture system text here.",
           )}
         </div>
       </div>
 
-      <InsightsPanel
-        lines={lines}
-        darkMode={darkMode}
-        insights={insights}
-        setInsights={setInsights}
-      />
+      <InsightsPanel lines={lines} darkMode={darkMode} insights={insights} setInsights={setInsights} />
     </div>
   );
 }
