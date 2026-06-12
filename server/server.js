@@ -15,7 +15,6 @@ app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Cloudinary configuration
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -39,9 +38,7 @@ const protect = (req, res, next) => {
     req.user = { id: decoded.id };
     next();
   } catch (err) {
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Token expired" });
-    }
+    if (err.name === "TokenExpiredError") return res.status(401).json({ error: "Token expired" });
     return res.status(401).json({ error: "Invalid token" });
   }
 };
@@ -67,11 +64,7 @@ const vaultSchema = new mongoose.Schema({
   keyPoints: [String],
   actionItems: [{ task: String, owner: String, priority: String }],
   flashcards: [{ front: String, back: String }],
-  quiz: [{
-    question: String,
-    options: [String],
-    answer: String
-  }]
+  quiz: [{ question: String, options: [String], answer: String }]
 });
 const VaultEntry = mongoose.model("VaultEntry", vaultSchema);
 
@@ -101,9 +94,9 @@ function getNextGroqKey() {
   return key;
 }
 
-// ── Whisper ───────────────────────────────────────────────────────────────────
-// CHANGED: accepts `language` param — forces bn/hi/en on Groq Whisper
-// instead of relying on auto-detection. Better Bengali/Hindi accuracy.
+// ── Whisper via Groq ──────────────────────────────────────────────────────────
+// Uses verbose_json → gets no_speech_prob per segment for real VAD
+// Forces language code → prevents auto-detect guessing wrong language
 
 async function callGroqWhisper(audioBuffer, mimeType, language) {
   const maxRetries = groqApiKeys.length;
@@ -116,10 +109,9 @@ async function callGroqWhisper(audioBuffer, mimeType, language) {
         contentType: mimeType || "audio/webm",
       });
       formData.append("model", "whisper-large-v3");
-      formData.append("response_format", "json");
+      formData.append("response_format", "verbose_json"); // needed for no_speech_prob
 
-      // CHANGED: force language when provided (e.g. bn-IN → bn, hi-IN → hi)
-      // Prevents Whisper auto-detecting wrong language on accented speech
+      // Force language → prevents cross-language hallucination
       if (language && language !== "auto") {
         const langCode = language.split("-")[0]; // "bn-IN" → "bn"
         formData.append("language", langCode);
@@ -135,6 +127,27 @@ async function callGroqWhisper(audioBuffer, mimeType, language) {
       if (!response.ok) throw new Error(`Groq ${response.status}`);
 
       const data = await response.json();
+
+      // ── no_speech_prob check: if Whisper itself thinks no speech → reject ──
+      // This is the most reliable server-side VAD — Whisper's own confidence
+      if (data.segments && data.segments.length > 0) {
+        const avgNoSpeech =
+          data.segments.reduce((sum, s) => sum + (s.no_speech_prob || 0), 0) /
+          data.segments.length;
+
+        if (avgNoSpeech > 0.6) {
+          console.log(`[Whisper] no_speech_prob=${avgNoSpeech.toFixed(3)}, rejecting as silence`);
+          return "";
+        }
+
+        // Also reject if ALL segments are high no_speech even at lower avg
+        const allHighNoSpeech = data.segments.every(s => (s.no_speech_prob || 0) > 0.5);
+        if (allHighNoSpeech && data.segments.length >= 1) {
+          console.log(`[Whisper] all segments high no_speech_prob, rejecting`);
+          return "";
+        }
+      }
+
       return data.text?.trim() || "";
     } catch (err) {
       console.error(`Whisper attempt ${attempt + 1} failed:`, err.message);
@@ -144,6 +157,10 @@ async function callGroqWhisper(audioBuffer, mimeType, language) {
 }
 
 // ── Hallucination Filter ──────────────────────────────────────────────────────
+// KEY FIX: Unicode normalization before comparison.
+// Bengali/Hindi chars can have different Unicode representations that look
+// identical visually but compare as different → unique.size > 1 even for repeats.
+// NFC normalize first, then check.
 
 const EXACT_NOISE = new Set([
   "thank you", "thanks", "bye", "goodbye", "hello", "ok", "okay",
@@ -153,34 +170,81 @@ const EXACT_NOISE = new Set([
   "i'm going to make a", "i'm going to make", "i'm going to",
   "hello everyone, i'm going to make",
   "subtitles by", "translated by", "transcribed by",
-  "looking at the camera","you","yourself","thank you","thanks",
-  "okay","ok","hello","bye","goodbye",
+  "looking at the camera", "you", "yourself",
   ".", "..", "...", " ",
+  // Common Bengali hallucinations from near-silence
+  "আমাদ", "আমাদ আমাদ", "সাইলা", "সাইলা সাইলা",
+  "প্রাক্ষন", "ধন্যবাদ", "ধন্যবাদ।",
+  // Common Hindi hallucinations
+  "नमस्ते", "धन्यवाद", "ठीक है",
 ]);
 
 const MEDIA_MARKER_RE = /^\[?(music|applause|laughter|foreign|inaudible|silence|noise)\]?$/i;
 
+// Whisper hallucination phrases — repeated patterns Whisper generates on silence
+const WHISPER_HALLUCINATION_PHRASES_RE = /^(thank you\.?\s*)+$/i;
+
 function isHallucination(text) {
   if (!text) return true;
-  const trimmed = text.trim();
-  const lower = trimmed.toLowerCase();
+
+  // NFC normalize — critical for Bengali/Hindi repeated-word detection
+  const trimmed = text.trim().normalize("NFC");
+  const lower = trimmed.toLowerCase().normalize("NFC");
 
   if (EXACT_NOISE.has(lower)) return true;
   if (MEDIA_MARKER_RE.test(trimmed)) return true;
-  if (/^[\s.,!?;:\-–—]+$/.test(trimmed)) return true;
-
-  const words = lower.split(/\s+/).filter(Boolean);
-  if (words.length >= 4) {
-    const unique = new Set(words);
-    if (unique.size <= 2) return true;
-  }
-
+  if (WHISPER_HALLUCINATION_PHRASES_RE.test(trimmed)) return true;
+  if (/^[\s.,!?;:\-–—।]+$/.test(trimmed)) return true; // includes Devanagari danda
   if (trimmed.length <= 1) return true;
 
-  const repeatedWords = lower.split(/\s+/);
-  if (repeatedWords.length >= 3) {
-    const unique = new Set(repeatedWords);
-    if (unique.size === 1) return true;
+  // Split on whitespace — NFC normalized
+  const words = lower.split(/\s+/).filter(Boolean);
+
+  // ── FIX 1: Catch 2+ identical words (was only 3+) ──────────────────────
+  // NFC normalize each word before Set comparison
+  // This catches "আমাদ আমাদ", "সাইলা সাইলা", "hello hello"
+  if (words.length >= 2) {
+    const normalizedWords = words.map(w => w.normalize("NFC"));
+    const unique = new Set(normalizedWords);
+    if (unique.size === 1) {
+      console.log(`[HalluFilter] 2+ identical words: "${trimmed}"`);
+      return true;
+    }
+  }
+
+  // ── FIX 2: Catch mostly-repeated 4+ words ──────────────────────────────
+  // e.g. "আমাদ আমাদ something আমাদ" — 4 words, only 2 unique
+  if (words.length >= 4) {
+    const normalizedWords = words.map(w => w.normalize("NFC"));
+    const unique = new Set(normalizedWords);
+    if (unique.size <= 2) {
+      console.log(`[HalluFilter] mostly-repeated ${words.length} words: "${trimmed}"`);
+      return true;
+    }
+  }
+
+  // ── FIX 3: Short non-Latin text (Bengali/Hindi) rejection ──────────────
+  // Real speech in Bengali/Hindi almost always has 3+ words.
+  // 1-2 non-Latin words = very likely noise/hallucination.
+  // Exception: meaningful short phrases allowed if > 20 chars (longer = more likely real)
+  if (words.length < 3) {
+    const hasNonLatin = /[\u0080-\uFFFF]/.test(trimmed);
+    if (hasNonLatin && trimmed.length < 20) {
+      console.log(`[HalluFilter] short non-Latin chunk rejected: "${trimmed}"`);
+      return true;
+    }
+  }
+
+  // ── FIX 4: Word diversity gate ──────────────────────────────────────────
+  // Low diversity = hallucination. e.g. "প্রাক্ষন X প্রাক্ষন Y" — many repeats
+  if (words.length >= 3) {
+    const normalizedWords = words.map(w => w.normalize("NFC"));
+    const unique = new Set(normalizedWords);
+    const diversity = unique.size / normalizedWords.length;
+    if (diversity < 0.4) {
+      console.log(`[HalluFilter] low diversity=${diversity.toFixed(2)}: "${trimmed}"`);
+      return true;
+    }
   }
 
   return false;
@@ -188,7 +252,7 @@ function isHallucination(text) {
 
 // ── Smart Transcript Buffer ───────────────────────────────────────────────────
 
-const SENTENCE_END_RE = /[.!?]["']?\s*$/;
+const SENTENCE_END_RE = /[.!?।]["']?\s*$/; // includes Devanagari danda
 const BUFFER_IDLE_MS = 3500;
 
 const transcriptBuffers = new Map();
@@ -258,23 +322,13 @@ NEW TEXT: "${text}"`
   }
 }
 
-async function translateToEnglish(text) {
-  if (!text) return "";
-  try {
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(text)}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    return data[0].map(c => c[0]).join(" ").trim();
-  } catch { return text; }
-}
-
 // ── Duplicate Detection ───────────────────────────────────────────────────────
 
 const recentTranscripts = new Map();
 
 function jaccardSimilarity(a, b) {
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
+  const setA = new Set(a.toLowerCase().normalize("NFC").split(/\s+/));
+  const setB = new Set(b.toLowerCase().normalize("NFC").split(/\s+/));
   const intersection = [...setA].filter(x => setB.has(x)).length;
   const union = new Set([...setA, ...setB]).size;
   return union === 0 ? 0 : intersection / union;
@@ -283,10 +337,7 @@ function jaccardSimilarity(a, b) {
 function isDuplicate(cacheKey, text) {
   const entry = recentTranscripts.get(cacheKey);
   if (!entry) return false;
-  if (Date.now() - entry.time > 30000) {
-    recentTranscripts.delete(cacheKey);
-    return false;
-  }
+  if (Date.now() - entry.time > 30000) { recentTranscripts.delete(cacheKey); return false; }
   return jaccardSimilarity(entry.text, text) > 0.85;
 }
 
@@ -311,6 +362,12 @@ async function flushBuffer(bufferKey, session_id, source) {
 
   if (!rawText) return;
 
+  // Run hallucination check again on combined buffer text
+  if (isHallucination(rawText)) {
+    console.log(`[${session_id}] buffer flush hallucination rejected: "${rawText}"`);
+    return;
+  }
+
   const cacheKey = `${session_id}:${source}`;
   if (isDuplicate(cacheKey, rawText)) {
     console.log(`[${session_id}] buffered duplicate skipped`);
@@ -322,6 +379,18 @@ async function flushBuffer(bufferKey, session_id, source) {
   const translated = await translateWithContext(rawText, context);
   pushTranslationContext(session_id, translated);
 
+  // Final check: don't persist if translation itself looks like a hallucination
+  // e.g. "We ourselves" from "আমাদ আমাদ" — catches cases that slip pre-translation
+  const translatedLower = translated.toLowerCase().trim();
+  const SHORT_TRANSLATED_NOISE = new Set([
+    "we ourselves", "ourselves", "we", "they themselves",
+    "she herself", "he himself", "yourself", "itself",
+  ]);
+  if (SHORT_TRANSLATED_NOISE.has(translatedLower)) {
+    console.log(`[${session_id}] translated hallucination rejected: "${rawText}" → "${translated}"`);
+    return;
+  }
+
   console.log(`[${session_id}][${source}] flushed: "${rawText}" → "${translated}"`);
 
   const timestamp = formatTimestamp();
@@ -329,10 +398,7 @@ async function flushBuffer(bufferKey, session_id, source) {
   try {
     const session = await Session.findOne({ session_id });
     if (session) {
-      await Session.findOneAndUpdate(
-        { session_id },
-        { text: session.text + tagged + "\n" }
-      );
+      await Session.findOneAndUpdate({ session_id }, { text: session.text + tagged + "\n" });
     }
   } catch (err) {
     console.error("DB persist error:", err.message);
@@ -345,21 +411,19 @@ async function flushBuffer(bufferKey, session_id, source) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // Transcribe — protected
-// CHANGED: reads `language` from req.body, passes to callGroqWhisper
-// Works for both mic and system audio (source param distinguishes)
 app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
-  const { session_id, source, language } = req.body; // CHANGED: added language
+  const { session_id, source, language } = req.body;
   if (!session_id) return res.status(400).json({ error: "session_id required" });
   if (!req.file) return res.status(400).json({ error: "audio required" });
 
-  // Verify session belongs to user
   const session = await Session.findOne({ session_id });
   if (session && session.userId && session.userId !== req.user.id) {
     return res.status(403).json({ error: "Forbidden" });
   }
 
   try {
-    // CHANGED: pass language so Whisper forces bn/hi/en instead of auto-detect
+    // Force language → Whisper uses correct model for Bengali/Hindi/English
+    // verbose_json → no_speech_prob per segment for real VAD
     const original = await callGroqWhisper(req.file.buffer, req.file.mimetype, language);
     if (!original) return res.json({ text: "" });
 
@@ -367,6 +431,16 @@ app.post("/transcribe", protect, upload.single("audio"), async (req, res) => {
 
     if (isHallucination(original)) {
       console.log(`[${session_id}] filtered hallucination: "${original}"`);
+      return res.json({ text: "" });
+    }
+
+    // Word diversity gate before buffering
+    // NFC normalize for correct Bengali/Hindi word counting
+    const words = original.trim().normalize("NFC").split(/\s+/);
+    const normalizedWords = words.map(w => w.toLowerCase().normalize("NFC"));
+    const diversity = new Set(normalizedWords).size / normalizedWords.length;
+    if (words.length >= 3 && diversity < 0.4) {
+      console.log(`[${session_id}] low diversity rejected: "${original}" (diversity=${diversity.toFixed(2)})`);
       return res.json({ text: "" });
     }
 
@@ -426,7 +500,7 @@ app.post("/summarise", protect, async (req, res) => {
   } catch { res.json({ summary: text }); }
 });
 
-// Start session — protected, stores userId
+// Start session — protected
 app.post("/start-session", protect, async (req, res) => {
   const session_id = req.body?.session_id || Date.now().toString();
   try {
@@ -441,7 +515,6 @@ app.post("/start-session", protect, async (req, res) => {
   }
 });
 
-// GET start-session — protected
 app.get("/start-session", protect, async (req, res) => {
   const session_id = Date.now().toString();
   try {
@@ -459,9 +532,7 @@ app.post("/push", protect, async (req, res) => {
   try {
     const session = await Session.findOne({ session_id });
     if (!session) return res.status(404).json({ error: "session not found" });
-    if (session.userId && session.userId !== req.user.id) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
+    if (session.userId && session.userId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
     await Session.findOneAndUpdate({ session_id }, { text: session.text + text + "\n" });
     res.json({ ok: true });
   } catch (err) {
@@ -489,11 +560,7 @@ app.get("/transcript/:session_id", protect, async (req, res) => {
   try {
     const session = await Session.findOne({
       session_id: req.params.session_id,
-      $or: [
-        { userId: req.user.id },
-        { userId: { $exists: false } },
-        { userId: null }
-      ]
+      $or: [{ userId: req.user.id }, { userId: { $exists: false } }, { userId: null }]
     });
     if (!session) return res.status(403).json({ error: "Forbidden" });
     res.json({ text: session.text });
@@ -505,9 +572,7 @@ app.get("/transcript/:session_id", protect, async (req, res) => {
 // Upload audio — protected
 app.post("/upload-audio", protect, upload.single("audio"), async (req, res) => {
   const { session_id } = req.body;
-  if (!session_id || !req.file) {
-    return res.status(400).json({ error: "session_id and audio file required" });
-  }
+  if (!session_id || !req.file) return res.status(400).json({ error: "session_id and audio file required" });
 
   const session = await Session.findOne({ session_id });
   if (session && session.userId && session.userId !== req.user.id) {
@@ -515,21 +580,13 @@ app.post("/upload-audio", protect, upload.single("audio"), async (req, res) => {
   }
 
   try {
-    console.log(`Uploading audio for session ${session_id}, size: ${req.file.size} bytes`);
-
-    if (!process.env.CLOUDINARY_CLOUD_NAME) {
-      throw new Error("Cloudinary not configured. Missing env variables.");
-    }
+    if (!process.env.CLOUDINARY_CLOUD_NAME) throw new Error("Cloudinary not configured.");
 
     const result = await new Promise((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
-        {
-          resource_type: "auto",
-          folder: "meetmind_audio",
-          public_id: session_id,
-        },
+        { resource_type: "auto", folder: "meetmind_audio", public_id: session_id },
         (error, uploadResult) => {
-          if (error) { console.error("Cloudinary upload error details:", error); reject(error); }
+          if (error) reject(error);
           else resolve(uploadResult);
         }
       );
@@ -538,13 +595,7 @@ app.post("/upload-audio", protect, upload.single("audio"), async (req, res) => {
 
     const audioUrl = result.secure_url;
     const audioDuration = Math.round(result.duration || 0);
-
-    await Session.findOneAndUpdate(
-      { session_id },
-      { audioUrl, audioDuration },
-      { upsert: true }
-    );
-
+    await Session.findOneAndUpdate({ session_id }, { audioUrl, audioDuration }, { upsert: true });
     res.json({ audioUrl, audioDuration });
   } catch (err) {
     console.error("Upload-audio error:", err);
@@ -557,11 +608,7 @@ app.get("/audio/:session_id", protect, async (req, res) => {
   try {
     const session = await Session.findOne({
       session_id: req.params.session_id,
-      $or: [
-        { userId: req.user.id },
-        { userId: { $exists: false } },
-        { userId: null }
-      ]
+      $or: [{ userId: req.user.id }, { userId: { $exists: false } }, { userId: null }]
     });
     if (!session) return res.status(403).json({ error: "Forbidden" });
     res.json({ audioUrl: session.audioUrl, audioDuration: session.audioDuration });
@@ -579,10 +626,7 @@ app.post("/ai-insights", protect, async (req, res) => {
     const apiKey = getNextGroqKey();
     const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         max_tokens: 2000,
@@ -593,7 +637,6 @@ app.post("/ai-insights", protect, async (req, res) => {
 
     if (!response.ok) {
       const err = await response.text();
-      console.error("Groq AI Insights error:", err);
       return res.status(500).json({ error: "Groq API error" });
     }
 
@@ -602,35 +645,25 @@ app.post("/ai-insights", protect, async (req, res) => {
     const clean = text.replace(/```json\n?|```/g, "").trim();
 
     let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch {
-      console.error("JSON parse failed:", clean.slice(0, 300));
-      return res.status(500).json({ error: "Failed to parse AI response" });
-    }
+    try { parsed = JSON.parse(clean); }
+    catch { return res.status(500).json({ error: "Failed to parse AI response" }); }
 
     res.json(parsed);
   } catch (err) {
-    console.error("AI Insights error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Vault save — protected, stores userId
+// Vault save — protected
 app.post("/vault/save", protect, async (req, res) => {
   const { session_id, transcript, summary, keyPoints, actionItems, flashcards, quiz } = req.body;
   if (!session_id) return res.status(400).json({ error: "session_id required" });
-
   try {
     const entry = await VaultEntry.create({
-      session_id,
-      userId: req.user.id,
-      transcript: transcript || "",
-      summary: summary || "",
-      keyPoints: keyPoints || [],
-      actionItems: actionItems || [],
-      flashcards: flashcards || [],
-      quiz: quiz || []
+      session_id, userId: req.user.id,
+      transcript: transcript || "", summary: summary || "",
+      keyPoints: keyPoints || [], actionItems: actionItems || [],
+      flashcards: flashcards || [], quiz: quiz || []
     });
     res.json({ ok: true, id: entry._id });
   } catch (err) {
@@ -638,25 +671,21 @@ app.post("/vault/save", protect, async (req, res) => {
   }
 });
 
-// List vault — protected, user-scoped
+// List vault — protected
 app.get("/vault", protect, async (req, res) => {
   try {
     const entries = await VaultEntry.find({ userId: req.user.id })
-      .sort({ savedAt: -1 })
-      .select("-transcript");
+      .sort({ savedAt: -1 }).select("-transcript");
     res.json(entries);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get vault entry — protected, ownership check
+// Get vault entry — protected
 app.get("/vault/:id", protect, async (req, res) => {
   try {
-    const entry = await VaultEntry.findOne({
-      _id: req.params.id,
-      userId: req.user.id
-    });
+    const entry = await VaultEntry.findOne({ _id: req.params.id, userId: req.user.id });
     if (!entry) return res.status(403).json({ error: "Forbidden" });
     res.json(entry);
   } catch (err) {
@@ -664,7 +693,6 @@ app.get("/vault/:id", protect, async (req, res) => {
   }
 });
 
-// Root
 app.get("/", (req, res) => res.json({ status: "ok", service: "AI Meeting Intelligence" }));
 
 const PORT = process.env.PORT || 5000;
